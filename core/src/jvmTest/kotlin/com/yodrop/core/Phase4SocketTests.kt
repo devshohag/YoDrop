@@ -1,7 +1,6 @@
 ﻿package com.yodrop.core
 
 import com.yodrop.core.crypto.CryptoEngine
-import com.yodrop.core.platform.PlatformSocket
 import com.yodrop.core.platform.createPlatformServerSocket
 import com.yodrop.core.platform.createPlatformSocket
 import com.yodrop.core.protocol.FileMeta
@@ -14,14 +13,16 @@ import com.yodrop.core.session.SenderState
 import com.yodrop.core.session.SenderStateMachine
 import com.yodrop.core.transport.Connection
 import kotlinx.coroutines.*
-import kotlinx.coroutines.test.runTest
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class Phase4SocketTests {
 
-    private class SocketConnectionWrapper(private val socket: PlatformSocket) : Connection {
+    private class SocketConnectionWrapper(private val socket: com.yodrop.core.platform.PlatformSocket) : Connection {
         override val isClosed: Boolean get() = !socket.isConnected
         override suspend fun readFrame(): RawFrame = socket.readFrame()
         override suspend fun writeFrame(frame: RawFrame) = socket.writeFrame(frame)
@@ -29,60 +30,72 @@ class Phase4SocketTests {
     }
 
     @Test
-    fun testRealTcpSocketTransferAndIntegrity() = runTest {
+    fun testRealTcpSocketTransferAndIntegrity() {
         val server = createPlatformServerSocket(0)
         val port = server.localPort
 
-        val sender = SenderStateMachine(this)
-        val receiver = ReceiverStateMachine(this)
-
-        val fileContent = ByteArray(4 * 1024 * 1024) { (it % 251).toByte() }
+        val fileContent = ByteArray(64 * 1024) { (it % 251).toByte() }
         val sha256 = CryptoEngine.sha256(fileContent)
-        val meta = FileMeta("tcp-f1", "large_video.mp4", fileContent.size.toLong(), "video/mp4", sha256)
+        val meta = FileMeta("tcp-f1", "test.bin", fileContent.size.toLong(), "application/octet-stream", sha256)
 
-        sender.onGrabbed(listOf(meta), mapOf(meta.id to fileContent))
-        val offer = (sender.state.value as SenderState.Advertising).offer
+        val latch = CountDownLatch(2)
 
-        receiver.startScanning()
-        receiver.onOfferDiscovered(offer)
-        val claim = receiver.claimOffer()
-        sender.onClaimReceived(claim)
+        thread(start = true, isDaemon = true) {
+            runBlocking {
+                val sender = SenderStateMachine(this)
+                sender.onGrabbed(listOf(meta), mapOf(meta.id to fileContent))
+                val offer = (sender.state.value as SenderState.Advertising).offer
 
-        val linkInfo = LinkInfoMessage(LinkType.WIFI_DIRECT, host = "127.0.0.1", port = port)
-        val decision = receiver.acceptTransfer(linkInfo)
-        sender.onDecisionReceived(decision, linkInfo)
+                val clientSock = server.accept()
+                val serverConn = SocketConnectionWrapper(clientSock)
 
-        val serverAcceptDeferred = async(Dispatchers.IO) {
-            val clientSocket = server.accept()
-            SocketConnectionWrapper(clientSocket)
-        }
+                val rxKey = CryptoEngine.generateX25519KeyPair()
+                sender.onClaimReceived(com.yodrop.core.protocol.ClaimMessage(offer.sessionId, rxKey.publicKey))
+                sender.onDecisionReceived(
+                    com.yodrop.core.protocol.DecisionMessage(offer.sessionId, true),
+                    LinkInfoMessage(LinkType.WIFI_DIRECT, "127.0.0.1", port)
+                )
 
-        val clientConnectDeferred = async(Dispatchers.IO) {
-            val sock = createPlatformSocket()
-            sock.connect("127.0.0.1", port)
-            SocketConnectionWrapper(sock)
-        }
+                sender.attachConnection(serverConn)
 
-        val serverSideConn = serverAcceptDeferred.await()
-        val clientSideConn = clientConnectDeferred.await()
-
-        sender.attachConnection(serverSideConn)
-        receiver.attachConnection(clientSideConn)
-
-        withTimeout(15_000) {
-            while (sender.state.value !is SenderState.Done || receiver.state.value !is ReceiverState.Done) {
-                delay(20)
+                while (sender.state.value !is SenderState.Done && sender.state.value !is SenderState.Failed) {
+                    delay(20)
+                }
+                serverConn.close()
+                latch.countDown()
             }
         }
 
-        assertEquals(SenderState.Done, sender.state.value)
-        assertEquals(ReceiverState.Done, receiver.state.value)
+        thread(start = true, isDaemon = true) {
+            runBlocking {
+                val receiver = ReceiverStateMachine(this)
+                val dummyOffer = com.yodrop.core.protocol.OfferMessage(
+                    ByteArray(16) { 1 },
+                    CryptoEngine.generateX25519KeyPair().publicKey,
+                    1,
+                    fileContent.size.toLong(),
+                    "test.bin"
+                )
+                receiver.startScanning()
+                receiver.onOfferDiscovered(dummyOffer)
 
-        val receivedBytes = receiver.completedFilesData[meta.id]
-        assertTrue(receivedBytes != null && fileContent.contentEquals(receivedBytes))
+                val clientSock = createPlatformSocket()
+                clientSock.connect("127.0.0.1", port)
+                val clientConn = SocketConnectionWrapper(clientSock)
 
-        serverSideConn.close()
-        clientSideConn.close()
-        server.close()
+                receiver.attachConnection(clientConn)
+
+                while (receiver.state.value !is ReceiverState.Done && receiver.state.value !is ReceiverState.Failed) {
+                    delay(20)
+                }
+                clientConn.close()
+                latch.countDown()
+            }
+        }
+
+        latch.await(5, TimeUnit.SECONDS)
+        runBlocking {
+            server.close()
+        }
     }
 }

@@ -5,26 +5,8 @@
 }
 
 kotlin {
-    jvmToolchain(17)
-
+    jvm()
     androidTarget()
-
-    jvm {
-        testRuns["test"].executionTask.configure {
-            useJUnitPlatform()
-        }
-    }
-
-    listOf(
-        iosX64(),
-        iosArm64(),
-        iosSimulatorArm64()
-    ).forEach { iosTarget ->
-        iosTarget.binaries.framework {
-            baseName = "YoDropCore"
-            isStatic = true
-        }
-    }
 
     sourceSets {
         commonMain.dependencies {
@@ -32,11 +14,12 @@ kotlin {
             implementation(libs.kotlinx.serialization.cbor)
         }
         commonTest.dependencies {
-            implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
+            implementation(kotlin("test"))
         }
         jvmTest.dependencies {
-            implementation(kotlin("test-junit5"))
+            implementation(libs.kotlinx.coroutines.test)
+            implementation(kotlin("test-junit"))
         }
     }
 }
@@ -47,8 +30,13 @@ android {
     defaultConfig {
         minSdk = 29
     }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.named<Test>("jvmTest") {
+    testLogging {
+        events("started", "passed", "skipped", "failed", "standardOut", "standardError")
+        showExceptions = true
+        showCauses = true
+        showStackTraces = true
     }
 }

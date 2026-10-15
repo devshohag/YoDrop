@@ -29,7 +29,7 @@ class SenderStateMachine(
     fun onGrabbed(files: List<FileMeta>, dataMap: Map<String, ByteArray>) {
         filesToSend = files
         fileDataMap = dataMap
-        _state.value = SenderState.Grabbed(files)
+        messageCounter = 0
 
         val keyPair = CryptoEngine.generateX25519KeyPair()
         myKeyPair = keyPair
@@ -48,16 +48,12 @@ class SenderStateMachine(
     }
 
     fun onClaimReceived(claim: ClaimMessage) {
-        val current = _state.value
-        if (current !is SenderState.Advertising) return
-
         val keyPair = myKeyPair ?: return
         val sid = sessionId ?: return
         val sharedSecret = CryptoEngine.computeSharedSecret(keyPair.privateKey, claim.receiverPubKey)
         val keys = CryptoEngine.deriveSessionKeys(sharedSecret, sid)
         sessionKeys = keys
 
-        _state.value = SenderState.Claimed(claim.receiverPubKey)
         _state.value = SenderState.AwaitAccept(keys.verifyCode)
     }
 
@@ -72,13 +68,13 @@ class SenderStateMachine(
     fun attachConnection(connection: Connection) {
         activeConnection = connection
         _state.value = SenderState.Auth
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             try {
                 runTransferLoop(connection)
             } catch (e: CancellationException) {
                 _state.value = SenderState.Cancelled("Cancelled by sender")
                 connection.close()
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 _state.value = SenderState.Failed("Transfer failed: ${e.message}")
                 connection.close()
             }
@@ -86,8 +82,8 @@ class SenderStateMachine(
     }
 
     private suspend fun runTransferLoop(connection: Connection) {
-        val keys = sessionKeys ?: throw IllegalStateException("No session keys")
-        val sid = sessionId ?: throw IllegalStateException("No sessionId")
+        val keys = sessionKeys ?: throw IllegalStateException("No session keys derived")
+        val sid = sessionId ?: throw IllegalStateException("No sessionId initialized")
 
         // 1. Send AUTH frame
         val authTag = CryptoEngine.computeHmacSha256(keys.senderToReceiverKey, "authsender".encodeToByteArray())
@@ -116,11 +112,9 @@ class SenderStateMachine(
                         val (start, end) = ChunkPlanner.getChunkByteRange(chunkIdx, fileSize)
                         val slice = rawData.copyOfRange(start.toInt(), end.toInt())
 
-                        // Encrypt with direction key and counter nonce
                         val nonce = NonceUtils.build12ByteNonce(keys.nonceBase, messageCounter++)
                         val ciphertext = CryptoEngine.encryptAesGcm(keys.senderToReceiverKey, nonce, slice)
 
-                        // Payload: [fileIdLen u8][fileId UTF8][chunkIdx u32][ciphertext]
                         val fileIdBytes = req.fileId.encodeToByteArray()
                         val payload = ByteArray(1 + fileIdBytes.size + 4 + ciphertext.size)
                         payload[0] = fileIdBytes.size.toByte()

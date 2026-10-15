@@ -6,9 +6,10 @@ import com.yodrop.core.protocol.DeviceCaps
 import com.yodrop.core.protocol.LinkType
 import com.yodrop.core.protocol.Platform
 import com.yodrop.core.transport.TransportSelector
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.*
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 import kotlin.test.*
 
 class Phase5SelectorTests {
@@ -31,7 +32,7 @@ class Phase5SelectorTests {
             peerIp = "192.168.1.120",
             totalBytes = 50 * 1024 * 1024
         )
-        assertEquals(LinkType.LAN, link, "When same LAN subnet is detected, LAN must be Priority 1")
+        assertEquals(LinkType.LAN, link)
     }
 
     @Test
@@ -45,7 +46,7 @@ class Phase5SelectorTests {
             peerIp = "10.0.0.12",
             totalBytes = 50 * 1024 * 1024
         )
-        assertEquals(LinkType.WIFI_DIRECT, link, "Different networks on Android must pick Wi-Fi Direct")
+        assertEquals(LinkType.WIFI_DIRECT, link)
     }
 
     @Test
@@ -59,28 +60,33 @@ class Phase5SelectorTests {
             peerIp = "192.168.1.120",
             totalBytes = 25 * 1024
         )
-        assertNull(link, "Payloads under 64 KB must return null (BLE-direct skip)")
+        assertNull(link)
     }
 
     @Test
-    fun testLanTransportLoopbackConnect() = runBlocking(Dispatchers.IO) {
+    fun testLanTransportLoopbackConnect() {
         val server = createPlatformServerSocket(0)
         val assignedPort = server.localPort
+        val latch = CountDownLatch(1)
+        var serverConnected = false
 
-        val acceptJob = async {
-            server.accept()
+        val serverThread = thread(start = true, isDaemon = true) {
+            runBlocking {
+                val sock = server.accept()
+                serverConnected = sock.isConnected
+                latch.countDown()
+                sock.close()
+            }
         }
 
-        val clientSocket = createPlatformSocket()
-        clientSocket.connect("127.0.0.1", assignedPort)
-
-        val serverSocket = acceptJob.await()
-
-        assertTrue(clientSocket.isConnected)
-        assertTrue(serverSocket.isConnected)
-
-        clientSocket.close()
-        serverSocket.close()
-        server.close()
+        runBlocking {
+            val clientSocket = createPlatformSocket()
+            clientSocket.connect("127.0.0.1", assignedPort)
+            assertTrue(clientSocket.isConnected)
+            latch.await(5, TimeUnit.SECONDS)
+            assertTrue(serverConnected)
+            clientSocket.close()
+            server.close()
+        }
     }
 }

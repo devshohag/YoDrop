@@ -10,6 +10,14 @@ import java.net.ServerSocket
 import java.net.Socket
 
 actual class PlatformSocket(private val socket: Socket) {
+    init {
+        runCatching {
+            socket.tcpNoDelay = true
+            socket.sendBufferSize = 128 * 1024
+            socket.receiveBufferSize = 128 * 1024
+        }
+    }
+
     private val outputStream: OutputStream by lazy { socket.getOutputStream() }
     private val inputStream: InputStream by lazy { socket.getInputStream() }
 
@@ -18,6 +26,7 @@ actual class PlatformSocket(private val socket: Socket) {
     actual suspend fun connect(host: String, port: Int) {
         withContext(Dispatchers.IO) {
             socket.connect(InetSocketAddress(host, port), 5000)
+            socket.tcpNoDelay = true
         }
     }
 
@@ -48,7 +57,10 @@ actual class PlatformSocket(private val socket: Socket) {
 
     actual suspend fun close() {
         withContext(Dispatchers.IO) {
-            runCatching { socket.close() }
+            runCatching {
+                outputStream.flush()
+                socket.close()
+            }
         }
     }
 
@@ -68,6 +80,7 @@ actual class PlatformServerSocket(private val serverSocket: ServerSocket) {
     actual suspend fun accept(): PlatformSocket {
         return withContext(Dispatchers.IO) {
             val clientSocket = serverSocket.accept()
+            clientSocket.tcpNoDelay = true
             PlatformSocket(clientSocket)
         }
     }

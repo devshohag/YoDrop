@@ -68,13 +68,13 @@ class ReceiverStateMachine(
     fun attachConnection(connection: Connection) {
         activeConnection = connection
         _state.value = ReceiverState.Auth
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             try {
                 runReceiveLoop(connection)
             } catch (e: CancellationException) {
                 _state.value = ReceiverState.Cancelled("Cancelled by receiver")
                 connection.close()
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 _state.value = ReceiverState.Failed("Receive failed: ${e.message}")
                 connection.close()
             }
@@ -99,22 +99,21 @@ class ReceiverStateMachine(
         require(manifestFrame.type == FrameType.MANIFEST) { "Expected MANIFEST frame" }
         val manifest = ProtocolCodec.decodePayload<ManifestMessage>(manifestFrame)
 
-        // 4. Pull-driven download for each file
+        var sessionCounter = 0
+
+        // 4. Download files sequentially
         for ((fileIdx, file) in manifest.files.withIndex()) {
             val totalChunks = ChunkPlanner.calculateTotalChunks(file.size, manifest.chunkSize)
             val bitmap = ChunkBitmap(totalChunks)
             val fileBuffer = ByteArray(file.size.toInt())
-            var messageCounter = 0
 
             while (!bitmap.isComplete() && !connection.isClosed) {
                 val missing = bitmap.getMissingChunks(batchSize = 16)
                 if (missing.isEmpty()) break
 
-                // Send CHUNK_REQ batch
                 val reqMsg = ChunkReqMessage(fileId = file.id, chunkIndices = missing)
                 connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CHUNK_REQ, reqMsg))
 
-                // Receive CHUNK_DATA for each requested index
                 for (expectedIdx in missing) {
                     val dataFrame = connection.readFrame()
                     require(dataFrame.type == FrameType.CHUNK_DATA) { "Expected CHUNK_DATA frame" }
@@ -129,20 +128,19 @@ class ReceiverStateMachine(
                             (payload[off + 3].toInt() and 0xFF)
                     val ciphertext = payload.copyOfRange(off + 4, payload.size)
 
-                    // Decrypt chunk
-                    val nonce = NonceUtils.build12ByteNonce(keys.nonceBase, messageCounter++)
+                    val nonce = NonceUtils.build12ByteNonce(keys.nonceBase, sessionCounter++)
                     val plaintext = CryptoEngine.decryptAesGcm(keys.senderToReceiverKey, nonce, ciphertext)
 
                     val (start, _) = ChunkPlanner.getChunkByteRange(chunkIdx, file.size, manifest.chunkSize)
                     plaintext.copyInto(fileBuffer, start.toInt())
                     bitmap.markReceived(chunkIdx)
 
-                    val fileProgress = (chunkIdx + 1).toFloat() / totalChunks.toFloat()
+                    val fileProgress = (fileIdx + (chunkIdx + 1).toFloat() / totalChunks.toFloat()) / manifest.files.size.toFloat()
                     _state.value = ReceiverState.Receiving(fileProgress, file.name)
                 }
             }
 
-            // 5. Verify SHA-256 integrity
+            // 5. Verify integrity and notify sender
             _state.value = ReceiverState.Verifying(file.id)
             val hash = CryptoEngine.sha256(fileBuffer)
             val matches = hash.contentEquals(file.sha256)
@@ -154,7 +152,7 @@ class ReceiverStateMachine(
             receivedFiles[file.id] = fileBuffer
         }
 
-        // 6. Await DONE frame from sender
+        // 6. Read DONE
         val doneFrame = connection.readFrame()
         require(doneFrame.type == FrameType.DONE) { "Expected DONE frame" }
         _state.value = ReceiverState.Done
