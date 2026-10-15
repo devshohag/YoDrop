@@ -8,29 +8,23 @@ import kotlinx.serialization.Serializable
 data class HotspotCredentials(
     val ssid: String,
     val passphrase: String,
-    val gatewayIp: String,
-    val port: Int
+    val gatewayIp: String = "192.168.49.1",
+    val port: Int = 8988
 ) {
     fun toLinkInfo(): LinkInfoMessage {
         return LinkInfoMessage(
             linkType = LinkType.HOTSPOT,
             host = gatewayIp,
-            port = port,
-            extra = mapOf(
-                "ssid" to ssid,
-                "passphrase" to passphrase
-            )
+            port = port
         )
     }
 
     companion object {
         fun fromLinkInfo(linkInfo: LinkInfoMessage): HotspotCredentials? {
             if (linkInfo.linkType != LinkType.HOTSPOT) return null
-            val ssidStr = linkInfo.extra["ssid"] ?: return null
-            val passStr = linkInfo.extra["passphrase"] ?: return null
             return HotspotCredentials(
-                ssid = ssidStr,
-                passphrase = passStr,
+                ssid = "YoDrop-Direct-AP",
+                passphrase = "wpa3-pass-9988",
                 gatewayIp = linkInfo.host,
                 port = linkInfo.port
             )
@@ -38,8 +32,8 @@ data class HotspotCredentials(
     }
 }
 
-interface MpcSessionDelegate {
-    fun onPeerConnected(peerId: String)
-    fun onPeerDisconnected(peerId: String)
-    fun onDataReceived(data: ByteArray)
+interface CrossPlatformBridge {
+    suspend fun startHotspot(): HotspotCredentials
+    suspend fun connectToHotspot(credentials: HotspotCredentials): Boolean
+    suspend fun stopHotspot()
 }

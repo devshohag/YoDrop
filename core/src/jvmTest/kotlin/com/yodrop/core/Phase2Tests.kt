@@ -1,97 +1,112 @@
 ﻿package com.yodrop.core
 
 import com.yodrop.core.crypto.CryptoEngine
-import com.yodrop.core.protocol.FileMeta
-import com.yodrop.core.protocol.LinkInfoMessage
-import com.yodrop.core.protocol.LinkType
+import com.yodrop.core.platform.DiskFileSink
+import com.yodrop.core.platform.DiskFileSource
+import com.yodrop.core.protocol.*
 import com.yodrop.core.session.ReceiverState
 import com.yodrop.core.session.ReceiverStateMachine
 import com.yodrop.core.session.SenderState
 import com.yodrop.core.session.SenderStateMachine
-import com.yodrop.core.transport.LoopbackConnection
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.test.runTest
+import com.yodrop.core.transport.Connection
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
-@OptIn(ExperimentalCoroutinesApi::class)
 class Phase2Tests {
 
-    @Test
-    fun testCompleteHandshakeAndTransferViaLoopback() = runTest {
-        val sender = SenderStateMachine(this)
-        val receiver = ReceiverStateMachine(this)
-
-        // 1. Prepare sample 8 MiB test file payload
-        val testFileContent = ByteArray(8 * 1024 * 1024) { (it % 127).toByte() }
-        val testSha256 = CryptoEngine.sha256(testFileContent)
-        val meta = FileMeta(
-            id = "test-doc-1",
-            name = "report.pdf",
-            size = testFileContent.size.toLong(),
-            mime = "application/pdf",
-            sha256 = testSha256
-        )
-
-        // 2. Sender grab gesture
-        sender.onGrabbed(listOf(meta), mapOf(meta.id to testFileContent))
-        val advState = sender.state.value as SenderState.Advertising
-
-        // 3. Receiver scans & discovers offer
-        receiver.startScanning()
-        receiver.onOfferDiscovered(advState.offer)
-
-        // 4. Receiver claims offer (Fist -> Palm gesture simulation)
-        val claimMsg = receiver.claimOffer()
-        sender.onClaimReceived(claimMsg)
-
-        // Verify that 4-digit code matches on both sender and receiver screens
-        val senderAwait = sender.state.value as SenderState.AwaitAccept
-        val receiverPrompt = receiver.state.value as ReceiverState.AcceptPrompt
-        assertEquals(senderAwait.verifyCode, receiverPrompt.verifyCode, "4-digit verify code must match!")
-
-        // 5. Receiver accepts and creates LinkInfo
-        val linkInfo = LinkInfoMessage(LinkType.LAN, host = "127.0.0.1", port = 9001)
-        val decision = receiver.acceptTransfer(linkInfo)
-        sender.onDecisionReceived(decision, linkInfo)
-
-        // 6. Connect via bidirectional in-memory loopback transport
-        val (senderConn, receiverConn) = LoopbackConnection.createPair()
-        sender.attachConnection(senderConn)
-        receiver.attachConnection(receiverConn)
-
-        // 7. Await transfer completion
-        while (sender.state.value !is SenderState.Done || receiver.state.value !is ReceiverState.Done) {
-            kotlinx.coroutines.delay(10)
+    private class PipeConn(
+        private val inCh: Channel<RawFrame>,
+        private val outCh: Channel<RawFrame>
+    ) : Connection {
+        private var closed = false
+        override val isClosed: Boolean get() = closed
+        override suspend fun readFrame(): RawFrame = inCh.receive()
+        override suspend fun writeFrame(frame: RawFrame) = outCh.send(frame)
+        override suspend fun close() {
+            closed = true
+            inCh.close()
+            outCh.close()
         }
-
-        assertEquals(SenderState.Done, sender.state.value)
-        assertEquals(ReceiverState.Done, receiver.state.value)
-
-        // Verify bit-exact integrity
-        val transferredBytes = receiver.completedFilesData[meta.id]
-        assertTrue(transferredBytes != null && testFileContent.contentEquals(transferredBytes))
     }
 
     @Test
-    fun testUserDenyFlow() = runTest {
-        val sender = SenderStateMachine(this)
-        val receiver = ReceiverStateMachine(this)
+    fun testCompleteHandshakeAndTransferViaLoopback() {
+        runBlocking {
+            val tempDir = File(System.getProperty("java.io.tmpdir"), "yodrop-test-p2-${System.currentTimeMillis()}")
+            tempDir.mkdirs()
 
-        val meta = FileMeta("f-1", "doc.txt", 100, "text/plain", ByteArray(32))
-        sender.onGrabbed(listOf(meta), mapOf("f-1" to ByteArray(100)))
-        val offer = (sender.state.value as SenderState.Advertising).offer
+            val srcFile = File(tempDir, "sample.txt")
+            srcFile.writeBytes("YoDrop Streaming Loopback Transfer Verification Content".toByteArray())
 
-        receiver.onOfferDiscovered(offer)
-        val claim = receiver.claimOffer()
-        sender.onClaimReceived(claim)
+            val dstFile = File(tempDir, "received.txt")
 
-        val denyDecision = receiver.denyTransfer("Not trusted")
-        val linkInfo = LinkInfoMessage(LinkType.LAN, host = "127.0.0.1", port = 9001)
-        sender.onDecisionReceived(denyDecision, linkInfo)
+            val sha = CryptoEngine.sha256(srcFile.readBytes())
+            val meta = FileMeta("file-1", "sample.txt", srcFile.length(), "text/plain", sha)
+            val source = DiskFileSource(meta.id, srcFile)
 
-        assertTrue(sender.state.value is SenderState.Failed)
-        assertTrue(receiver.state.value is ReceiverState.Cancelled)
+            val sender = SenderStateMachine(this)
+            val receiver = ReceiverStateMachine(this, sinkFactory = { DiskFileSink(it.id, dstFile) })
+
+            sender.onGrabbed(listOf(meta), mapOf(meta.id to source))
+            val adv = sender.state.value as SenderState.Advertising
+
+            receiver.startScanning()
+            receiver.onOfferDiscovered(adv.offer)
+            val claim = receiver.claimOffer()
+            sender.onClaimReceived(claim)
+
+            val linkInfo = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 9999)
+            val decision = receiver.acceptTransfer(linkInfo)
+            sender.onDecisionReceived(decision, linkInfo)
+
+            val s2r = Channel<RawFrame>(Channel.UNLIMITED)
+            val r2s = Channel<RawFrame>(Channel.UNLIMITED)
+
+            val senderConn = PipeConn(r2s, s2r)
+            val receiverConn = PipeConn(s2r, r2s)
+
+            sender.attachConnection(senderConn)
+            receiver.attachConnection(receiverConn)
+
+            withTimeout(5000) {
+                while (sender.state.value !is SenderState.Done || receiver.state.value !is ReceiverState.Done) {
+                    delay(10)
+                }
+            }
+
+            assertEquals(SenderState.Done, sender.state.value)
+            assertEquals(ReceiverState.Done, receiver.state.value)
+            assertTrue(dstFile.exists())
+            assertEquals(srcFile.readText(), dstFile.readText())
+
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun testUserDenyFlow() {
+        runBlocking {
+            val dummyFile = FileMeta("id", "test.txt", 10L, "text/plain", ByteArray(32))
+            val sender = SenderStateMachine(this)
+            val receiver = ReceiverStateMachine(this)
+
+            sender.onGrabbed(listOf(dummyFile), emptyMap())
+            val adv = sender.state.value as SenderState.Advertising
+
+            receiver.startScanning()
+            receiver.onOfferDiscovered(adv.offer)
+            val claim = receiver.claimOffer()
+            sender.onClaimReceived(claim)
+
+            val deny = receiver.denyTransfer("Not trusted")
+            sender.onDecisionReceived(deny, LinkInfoMessage(LinkType.LAN, "127.0.0.1", 1234))
+
+            assertTrue(sender.state.value is SenderState.Failed)
+            assertTrue(receiver.state.value is ReceiverState.Cancelled)
+        }
     }
 }

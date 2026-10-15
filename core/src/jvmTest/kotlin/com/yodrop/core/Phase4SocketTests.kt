@@ -1,6 +1,8 @@
 ﻿package com.yodrop.core
 
 import com.yodrop.core.crypto.CryptoEngine
+import com.yodrop.core.platform.DiskFileSink
+import com.yodrop.core.platform.DiskFileSource
 import com.yodrop.core.platform.createPlatformServerSocket
 import com.yodrop.core.platform.createPlatformSocket
 import com.yodrop.core.protocol.FileMeta
@@ -13,6 +15,7 @@ import com.yodrop.core.session.SenderState
 import com.yodrop.core.session.SenderStateMachine
 import com.yodrop.core.transport.Connection
 import kotlinx.coroutines.*
+import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
@@ -31,31 +34,43 @@ class Phase4SocketTests {
 
     @Test
     fun testRealTcpSocketTransferAndIntegrity() {
+        val tempDir = File(System.getProperty("java.io.tmpdir"), "yodrop-test-p4-${System.currentTimeMillis()}")
+        tempDir.mkdirs()
+
+        val srcFile = File(tempDir, "tcp_test.bin")
+        val fileContent = ByteArray(64 * 1024) { (it % 251).toByte() }
+        srcFile.writeBytes(fileContent)
+
+        val dstFile = File(tempDir, "tcp_received.bin")
+
+        val sha256 = CryptoEngine.sha256(fileContent)
+        val meta = FileMeta("tcp-f1", "tcp_test.bin", fileContent.size.toLong(), "application/octet-stream", sha256)
+        val source = DiskFileSource(meta.id, srcFile)
+
         val server = createPlatformServerSocket(0)
         val port = server.localPort
-
-        val fileContent = ByteArray(64 * 1024) { (it % 251).toByte() }
-        val sha256 = CryptoEngine.sha256(fileContent)
-        val meta = FileMeta("tcp-f1", "test.bin", fileContent.size.toLong(), "application/octet-stream", sha256)
-
         val latch = CountDownLatch(2)
+
+        val scope = CoroutineScope(Dispatchers.IO)
+        val sender = SenderStateMachine(scope)
+        val receiver = ReceiverStateMachine(scope, sinkFactory = { DiskFileSink(it.id, dstFile) })
+
+        sender.onGrabbed(listOf(meta), mapOf(meta.id to source))
+        val offer = (sender.state.value as SenderState.Advertising).offer
+
+        receiver.startScanning()
+        receiver.onOfferDiscovered(offer)
+        val claim = receiver.claimOffer()
+        sender.onClaimReceived(claim)
+
+        val linkInfo = LinkInfoMessage(LinkType.WIFI_DIRECT, "127.0.0.1", port)
+        val decision = receiver.acceptTransfer(linkInfo)
+        sender.onDecisionReceived(decision, linkInfo)
 
         thread(start = true, isDaemon = true) {
             runBlocking {
-                val sender = SenderStateMachine(this)
-                sender.onGrabbed(listOf(meta), mapOf(meta.id to fileContent))
-                val offer = (sender.state.value as SenderState.Advertising).offer
-
                 val clientSock = server.accept()
                 val serverConn = SocketConnectionWrapper(clientSock)
-
-                val rxKey = CryptoEngine.generateX25519KeyPair()
-                sender.onClaimReceived(com.yodrop.core.protocol.ClaimMessage(offer.sessionId, rxKey.publicKey))
-                sender.onDecisionReceived(
-                    com.yodrop.core.protocol.DecisionMessage(offer.sessionId, true),
-                    LinkInfoMessage(LinkType.WIFI_DIRECT, "127.0.0.1", port)
-                )
-
                 sender.attachConnection(serverConn)
 
                 while (sender.state.value !is SenderState.Done && sender.state.value !is SenderState.Failed) {
@@ -68,21 +83,9 @@ class Phase4SocketTests {
 
         thread(start = true, isDaemon = true) {
             runBlocking {
-                val receiver = ReceiverStateMachine(this)
-                val dummyOffer = com.yodrop.core.protocol.OfferMessage(
-                    ByteArray(16) { 1 },
-                    CryptoEngine.generateX25519KeyPair().publicKey,
-                    1,
-                    fileContent.size.toLong(),
-                    "test.bin"
-                )
-                receiver.startScanning()
-                receiver.onOfferDiscovered(dummyOffer)
-
                 val clientSock = createPlatformSocket()
                 clientSock.connect("127.0.0.1", port)
                 val clientConn = SocketConnectionWrapper(clientSock)
-
                 receiver.attachConnection(clientConn)
 
                 while (receiver.state.value !is ReceiverState.Done && receiver.state.value !is ReceiverState.Failed) {
@@ -93,9 +96,13 @@ class Phase4SocketTests {
             }
         }
 
-        latch.await(5, TimeUnit.SECONDS)
+        latch.await(10, TimeUnit.SECONDS)
         runBlocking {
             server.close()
         }
+
+        assertTrue(dstFile.exists(), "Target file must exist after transfer commit")
+        assertEquals(srcFile.length(), dstFile.length())
+        tempDir.deleteRecursively()
     }
 }

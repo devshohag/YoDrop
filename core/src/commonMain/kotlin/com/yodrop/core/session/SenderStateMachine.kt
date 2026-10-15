@@ -4,6 +4,7 @@ import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.crypto.KeyPair
 import com.yodrop.core.crypto.NonceUtils
 import com.yodrop.core.crypto.SessionKeys
+import com.yodrop.core.platform.FileSource
 import com.yodrop.core.protocol.*
 import com.yodrop.core.transfer.ChunkPlanner
 import com.yodrop.core.transport.Connection
@@ -23,13 +24,13 @@ class SenderStateMachine(
     var sessionKeys: SessionKeys? = null
     var sessionId: ByteArray? = null
     private var filesToSend: List<FileMeta> = emptyList()
-    private var fileDataMap: Map<String, ByteArray> = emptyMap()
+    private var fileSourceMap: Map<String, FileSource> = emptyMap()
     private var activeConnection: Connection? = null
     private var attemptCounter = 0
 
-    fun onGrabbed(files: List<FileMeta>, dataMap: Map<String, ByteArray>) {
+    fun onGrabbed(files: List<FileMeta>, sources: Map<String, FileSource>) {
         filesToSend = files
-        fileDataMap = dataMap
+        fileSourceMap = sources
         attemptCounter = 0
 
         val keyPair = CryptoEngine.generateX25519KeyPair()
@@ -79,6 +80,8 @@ class SenderStateMachine(
             } catch (e: Throwable) {
                 _state.value = SenderState.Failed("Transfer failed: ${e.message}")
                 connection.close()
+            } finally {
+                fileSourceMap.values.forEach { runCatching { it.close() } }
             }
         }
     }
@@ -118,6 +121,7 @@ class SenderStateMachine(
         }
 
         val manifest = ManifestMessage(files = filesToSend)
+        manifest.validate()
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.MANIFEST, manifest))
 
         var completedFiles = 0
@@ -126,12 +130,13 @@ class SenderStateMachine(
             when (frame.type) {
                 FrameType.CHUNK_REQ -> {
                     val req = ProtocolCodec.decodePayload<ChunkReqMessage>(frame)
-                    val rawData = fileDataMap[req.fileId] ?: throw IllegalStateException("File not found: ${req.fileId}")
-                    val fileSize = rawData.size.toLong()
+                    val source = fileSourceMap[req.fileId] ?: throw IllegalStateException("File source not found: ${req.fileId}")
+                    val fileSize = source.size
 
                     for (chunkIdx in req.chunkIndices) {
-                        val (start, end) = ChunkPlanner.getChunkByteRange(chunkIdx, fileSize)
-                        val slice = rawData.copyOfRange(start.toInt(), end.toInt())
+                        val (start, end) = ChunkPlanner.getChunkByteRange(chunkIdx, fileSize, manifest.chunkSize)
+                        val length = (end - start).toInt()
+                        val slice = source.readChunk(start, length)
 
                         val currentAttempt = attemptCounter++
                         val nonce = NonceUtils.buildChunkNonce(keys.nonceBase, chunkIdx, currentAttempt)

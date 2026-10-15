@@ -42,3 +42,10 @@
   - File count capped at 1,000 files per manifest.
   - Chunk size must be between 64 KiB and 8 MiB.
   - File names are sanitized against path traversal (`..`, `/`, `\`) and ASCII control characters.
+
+## [T5] Streaming File IO & OOM Prevention
+- **Decision**: Zero in-memory whole-file storage.
+- **Architecture**:
+  - `FileSource`: Random-access streaming abstraction reading exact `[offset, len)` slices from disk via `RandomAccessFile`/`FileChannel`.
+  - `FileSink`: Random-access streaming sink writing chunks directly into temporary `.part` files on disk, calculating incremental or sequential post-transfer SHA-256 without loading files into RAM.
+  - On verification success, atomic rename from `.part` to final destination file.
