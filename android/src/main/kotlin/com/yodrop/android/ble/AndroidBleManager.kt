@@ -1,5 +1,10 @@
 ﻿package com.yodrop.android.ble
 
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.cbor.Cbor
+import kotlinx.serialization.decodeFromByteArray
+import kotlinx.serialization.encodeToByteArray
+
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
@@ -12,10 +17,13 @@ import kotlinx.coroutines.flow.asSharedFlow
 import java.util.*
 
 @SuppressLint("MissingPermission")
+@OptIn(ExperimentalSerializationApi::class)
 class AndroidBleManager(
     private val context: Context,
     private val scope: CoroutineScope
 ) {
+    private val bleCbor = Cbor { ignoreUnknownKeys = true }
+
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? = bluetoothManager.adapter
     private var advertiser: BluetoothLeAdvertiser? = null
@@ -49,7 +57,7 @@ class AndroidBleManager(
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
 
-        val offerBytes = ProtocolCodec.cbor.encodeToByteArray(OfferMessage.serializer(), offer)
+        val offerBytes = bleCbor.encodeToByteArray(OfferMessage.serializer(), offer)
         // Service Data truncated if too large; full data served through GATT
         val serviceData = if (offerBytes.size <= 24) offerBytes else offer.sessionId
 
@@ -87,11 +95,11 @@ class AndroidBleManager(
 
     fun sendControlMessage(device: BluetoothDevice?, message: BleControlMessage) {
         val bytes = when (message) {
-            is HelloMessage -> ProtocolCodec.cbor.encodeToByteArray(HelloMessage.serializer(), message)
-            is OfferMessage -> ProtocolCodec.cbor.encodeToByteArray(OfferMessage.serializer(), message)
-            is ClaimMessage -> ProtocolCodec.cbor.encodeToByteArray(ClaimMessage.serializer(), message)
-            is DecisionMessage -> ProtocolCodec.cbor.encodeToByteArray(DecisionMessage.serializer(), message)
-            is LinkInfoMessage -> ProtocolCodec.cbor.encodeToByteArray(LinkInfoMessage.serializer(), message)
+            is HelloMessage -> bleCbor.encodeToByteArray(HelloMessage.serializer(), message)
+            is OfferMessage -> bleCbor.encodeToByteArray(OfferMessage.serializer(), message)
+            is ClaimMessage -> bleCbor.encodeToByteArray(ClaimMessage.serializer(), message)
+            is DecisionMessage -> bleCbor.encodeToByteArray(DecisionMessage.serializer(), message)
+            is LinkInfoMessage -> bleCbor.encodeToByteArray(LinkInfoMessage.serializer(), message)
         }
 
         val packets = BleFragmenter.fragment(msgId = txCounter++, data = bytes, mtu = 240)
@@ -217,17 +225,17 @@ class AndroidBleManager(
         scope.launch {
             try {
                 // Determine message by deserializing candidates
-                val claim = runCatching { ProtocolCodec.cbor.decodeFromByteArray(ClaimMessage.serializer(), bytes) }.getOrNull()
+                val claim = runCatching { bleCbor.decodeFromByteArray(ClaimMessage.serializer(), bytes) }.getOrNull()
                 if (claim != null) {
                     _incomingMessages.emit(claim)
                     return@launch
                 }
-                val decision = runCatching { ProtocolCodec.cbor.decodeFromByteArray(DecisionMessage.serializer(), bytes) }.getOrNull()
+                val decision = runCatching { bleCbor.decodeFromByteArray(DecisionMessage.serializer(), bytes) }.getOrNull()
                 if (decision != null) {
                     _incomingMessages.emit(decision)
                     return@launch
                 }
-                val offer = runCatching { ProtocolCodec.cbor.decodeFromByteArray(OfferMessage.serializer(), bytes) }.getOrNull()
+                val offer = runCatching { bleCbor.decodeFromByteArray(OfferMessage.serializer(), bytes) }.getOrNull()
                 if (offer != null) {
                     _discoveredOffers.emit(offer)
                     _incomingMessages.emit(offer)
@@ -237,3 +245,4 @@ class AndroidBleManager(
         }
     }
 }
+

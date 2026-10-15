@@ -1,17 +1,11 @@
 ﻿package com.yodrop.android.ui
 
-import androidx.compose.animation.*
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.yodrop.core.session.ReceiverState
 import com.yodrop.core.session.SenderState
 
@@ -19,138 +13,126 @@ import com.yodrop.core.session.SenderState
 fun MainScreen(
     senderState: SenderState,
     receiverState: ReceiverState,
-    onSendTapped: () -> Unit,
-    onReceiveTapped: () -> Unit,
-    onAcceptTapped: () -> Unit,
-    onDenyTapped: () -> Unit,
-    onCancelTapped: () -> Unit
+    onSendClick: () -> Unit,
+    onReceiveClick: () -> Unit,
+    onAcceptClick: () -> Unit,
+    onDenyClick: () -> Unit,
+    onCancelClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    Surface(
-        modifier = Modifier.fillMaxSize(),
-        color = MaterialTheme.colorScheme.background
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.SpaceBetween
-        ) {
-            // Header
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(
-                    text = "YoDrop",
-                    fontSize = 32.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Text(
-                    text = "High-Speed Offline P2P Transfer",
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+        Text(
+            text = "YoDrop",
+            style = MaterialTheme.typography.headlineLarge,
+            modifier = Modifier.padding(bottom = 32.dp)
+        )
+
+        when {
+            senderState is SenderState.Idle && receiverState is ReceiverState.Idle -> {
+                Button(
+                    onClick = onSendClick,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                ) {
+                    Text("Send File")
+                }
+                OutlinedButton(
+                    onClick = onReceiveClick,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                ) {
+                    Text("Receive")
+                }
             }
 
-            // Central Status Card
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 16.dp),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-            ) {
-                Column(
-                    modifier = Modifier.padding(20.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
+            senderState is SenderState.Advertising -> {
+                CircularProgressIndicator()
+                Text("Advertising... Waiting for receiver", modifier = Modifier.padding(top = 16.dp))
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Cancel")
+                }
+            }
+
+            senderState is SenderState.AwaitAccept -> {
+                Text("Verification Code:")
+                Text(
+                    text = senderState.verifyCode,
+                    style = MaterialTheme.typography.displayMedium,
+                    modifier = Modifier.padding(vertical = 16.dp)
+                )
+                Text("Compare code with receiver and wait for acceptance.")
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Cancel")
+                }
+            }
+
+            receiverState is ReceiverState.AcceptPrompt -> {
+                Text("Incoming Transfer from ${receiverState.offer.previewName}")
+                Text(
+                    text = receiverState.verifyCode,
+                    style = MaterialTheme.typography.displayMedium,
+                    modifier = Modifier.padding(vertical = 16.dp)
+                )
+                Text("Does this code match the sender?")
+                Row(
+                    modifier = Modifier.padding(top = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    when {
-                        senderState is SenderState.Advertising -> {
-                            Text("Broadcasting Transfer...", fontWeight = FontWeight.SemiBold)
-                            Spacer(Modifier.height(8.dp))
-                            Text("File: ${senderState.offer.previewName}")
-                            Text("Size: ${senderState.offer.totalBytes / (1024 * 1024)} MB")
-                            CircularProgressIndicator(Modifier.padding(top = 16.dp))
-                        }
-                        senderState is SenderState.AwaitAccept -> {
-                            Text("Compare 4-Digit Verification Code:", fontWeight = FontWeight.Medium)
-                            Text(
-                                text = senderState.verifyCode,
-                                fontSize = 40.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.padding(vertical = 12.dp)
-                            )
-                            Text("Confirm this matches the receiver's phone.")
-                        }
-                        receiverState is ReceiverState.AcceptPrompt -> {
-                            Text("Incoming Transfer Request!", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                            Spacer(Modifier.height(8.dp))
-                            Text("File: ${receiverState.offer.previewName}")
-                            Text(
-                                text = receiverState.verifyCode,
-                                fontSize = 40.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.padding(vertical = 12.dp)
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceEvenly
-                            ) {
-                                Button(
-                                    onClick = onAcceptTapped,
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
-                                ) {
-                                    Text("Accept")
-                                }
-                                OutlinedButton(onClick = onDenyTapped) {
-                                    Text("Decline")
-                                }
-                            }
-                        }
-                        senderState is SenderState.Transferring -> {
-                            Text("Sending: ${senderState.currentFile}")
-                            LinearProgressIndicator(
-                                progress = { senderState.progressPercent },
-                                modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
-                            )
-                        }
-                        receiverState is ReceiverState.Receiving -> {
-                            Text("Receiving: ${receiverState.currentFile}")
-                            LinearProgressIndicator(
-                                progress = { receiverState.progressPercent },
-                                modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
-                            )
-                        }
-                        senderState is SenderState.Done || receiverState is ReceiverState.Done -> {
-                            Text("✅ Transfer Finished!", fontWeight = FontWeight.Bold, color = Color(0xFF2E7D32))
-                        }
-                        else -> {
-                            Text("Ready to share files.")
-                            Text("Open camera for Gesture or tap buttons below.", fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
-                        }
+                    Button(onClick = onAcceptClick) {
+                        Text("Accept")
+                    }
+                    OutlinedButton(onClick = onDenyClick) {
+                        Text("Deny")
                     }
                 }
             }
 
-            // Bottom Action Controls (Tap Fallback)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                Button(
-                    onClick = onSendTapped,
-                    modifier = Modifier.weight(1f).height(52.dp),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text("Send File (Tap)")
+            senderState is SenderState.Transferring -> {
+                Text("Sending: ${senderState.currentFileName}")
+                LinearProgressIndicator(
+                    progress = { senderState.progress },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp)
+                )
+                Text("${(senderState.progress * 100).toInt()}%")
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Cancel")
                 }
-                OutlinedButton(
-                    onClick = onReceiveTapped,
-                    modifier = Modifier.weight(1f).height(52.dp),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text("Receive (Tap)")
+            }
+
+            receiverState is ReceiverState.Receiving -> {
+                Text("Receiving: ${receiverState.currentFileName}")
+                LinearProgressIndicator(
+                    progress = { receiverState.progress },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp)
+                )
+                Text("${(receiverState.progress * 100).toInt()}%")
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Cancel")
+                }
+            }
+
+            senderState is SenderState.Done || receiverState is ReceiverState.Done -> {
+                Text("Transfer Complete!", style = MaterialTheme.typography.headlineMedium)
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Back to Home")
+                }
+            }
+
+            senderState is SenderState.Failed -> {
+                Text("Transfer Failed: ${senderState.error}", color = MaterialTheme.colorScheme.error)
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Reset")
+                }
+            }
+
+            receiverState is ReceiverState.Failed -> {
+                Text("Transfer Failed: ${receiverState.error}", color = MaterialTheme.colorScheme.error)
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Reset")
                 }
             }
         }
