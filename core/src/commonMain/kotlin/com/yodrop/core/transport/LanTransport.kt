@@ -3,18 +3,19 @@
 import com.yodrop.core.platform.createPlatformServerSocket
 import com.yodrop.core.platform.createPlatformSocket
 import com.yodrop.core.protocol.LinkInfoMessage
-import com.yodrop.core.protocol.RawFrame
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 
 class LanTransport : Transport {
 
     override suspend fun connect(linkInfo: LinkInfoMessage): Connection {
         val socket = createPlatformSocket()
-        socket.connect(linkInfo.host, linkInfo.port)
-        return object : Connection {
-            override val isClosed: Boolean get() = !socket.isConnected
-            override suspend fun readFrame(): RawFrame = socket.readFrame()
-            override suspend fun writeFrame(frame: RawFrame) = socket.writeFrame(frame)
-            override suspend fun close() = socket.close()
+        try {
+            socket.connect(linkInfo.host, linkInfo.port)
+            return TcpConnection(socket)
+        } catch (failure: Exception) {
+            withContext(NonCancellable) { runCatching { socket.close() } }
+            throw failure
         }
     }
 
@@ -23,12 +24,7 @@ class LanTransport : Transport {
         return object : ConnectionListener {
             override suspend fun accept(): Connection {
                 val client = server.accept()
-                return object : Connection {
-                    override val isClosed: Boolean get() = !client.isConnected
-                    override suspend fun readFrame(): RawFrame = client.readFrame()
-                    override suspend fun writeFrame(frame: RawFrame) = client.writeFrame(frame)
-                    override suspend fun close() = client.close()
-                }
+                return TcpConnection(client)
             }
             override suspend fun close() = server.close()
         }

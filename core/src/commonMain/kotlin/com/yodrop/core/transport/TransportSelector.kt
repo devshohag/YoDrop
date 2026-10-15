@@ -1,74 +1,77 @@
-﻿package com.yodrop.core.transport
+package com.yodrop.core.transport
 
-import com.yodrop.core.protocol.*
+import com.yodrop.core.protocol.DeviceCaps
+import com.yodrop.core.protocol.LinkType
+import com.yodrop.core.protocol.Platform
+
+sealed interface TransportSelection {
+    data object BleOnly : TransportSelection
+    data class DataLink(val linkType: LinkType) : TransportSelection
+    data object Unavailable : TransportSelection
+}
+
+/** IPv4 address and actual prefix length of the sender's active LAN interface. */
+data class LanAddress(val ip: String, val prefixLength: Int)
 
 object TransportSelector {
+    const val SMALL_PAYLOAD_THRESHOLD_BYTES = 64 * 1024L
 
-    const val SMALL_PAYLOAD_THRESHOLD_BYTES = 64 * 1024L // 64 KB
-
+    /** Sender-owned selection. Missing LAN metadata never implies a /24 network. */
     fun selectTransport(
-        myPlatform: Platform,
+        senderPlatform: Platform,
         peerPlatform: Platform,
-        myCaps: Int,
+        senderCaps: Int,
         peerCaps: Int,
-        myIp: String?,
+        senderIp: String?,
         peerIp: String?,
-        totalBytes: Long
-    ): LinkType? {
-        // Priority 5: Payload < 64 KB -> BLE direct (no Wi-Fi/data link setup needed)
-        if (totalBytes in 1..SMALL_PAYLOAD_THRESHOLD_BYTES) {
-            return null // Signal to use BLE data channel directly
-        }
+        totalBytes: Long,
+        senderPrefixLength: Int? = null
+    ): TransportSelection {
+        require(totalBytes >= 0) { "Payload size must be non-negative" }
+        fun bothHave(cap: Int) = senderCaps and cap != 0 && peerCaps and cap != 0
+        fun dataLink(type: LinkType) = TransportSelection.DataLink(type)
 
-        // Priority 1: Same LAN (both have CAP_LAN and same subnet)
-        val bothHaveLanCap = (myCaps and DeviceCaps.CAP_LAN != 0) && (peerCaps and DeviceCaps.CAP_LAN != 0)
-        if (bothHaveLanCap && myIp != null && peerIp != null && isSameSubnet(myIp, peerIp)) {
-            return LinkType.LAN
+        if (totalBytes < SMALL_PAYLOAD_THRESHOLD_BYTES && bothHave(DeviceCaps.CAP_BLE)) {
+            return TransportSelection.BleOnly
         }
-
-        // Priority 2: Android <-> Android -> Wi-Fi Direct
-        if (myPlatform == Platform.ANDROID && peerPlatform == Platform.ANDROID) {
-            val bothSupportWfd = (myCaps and DeviceCaps.CAP_WIFI_DIRECT != 0) && (peerCaps and DeviceCaps.CAP_WIFI_DIRECT != 0)
-            if (bothSupportWfd) {
-                return LinkType.WIFI_DIRECT
-            }
+        if (bothHave(DeviceCaps.CAP_LAN) && senderIp != null && peerIp != null &&
+            senderPrefixLength != null && isSameSubnet(senderIp, peerIp, senderPrefixLength)) {
+            return dataLink(LinkType.LAN)
         }
-
-        // Priority 3: iOS <-> iOS -> MultipeerConnectivity
-        if (myPlatform == Platform.IOS && peerPlatform == Platform.IOS) {
-            val bothSupportMpc = (myCaps and DeviceCaps.CAP_MPC != 0) && (peerCaps and DeviceCaps.CAP_MPC != 0)
-            if (bothSupportMpc) {
-                return LinkType.MPC
-            }
+        if (senderPlatform == Platform.ANDROID && peerPlatform == Platform.ANDROID &&
+            bothHave(DeviceCaps.CAP_WIFI_DIRECT)) {
+            return dataLink(LinkType.WIFI_DIRECT)
         }
-
-        // Priority 4: Android -> iOS / Cross-Platform -> Hotspot
-        val hostCanHotspot = (myCaps and DeviceCaps.CAP_HOTSPOT_HOST != 0)
-        if (hostCanHotspot) {
-            return LinkType.HOTSPOT
+        if (senderPlatform == Platform.IOS && peerPlatform == Platform.IOS &&
+            bothHave(DeviceCaps.CAP_MPC)) {
+            return dataLink(LinkType.MPC)
         }
-
-        // Fallback to Wi-Fi Direct if available
-        if (myCaps and DeviceCaps.CAP_WIFI_DIRECT != 0) {
-            return LinkType.WIFI_DIRECT
+        if (senderPlatform == Platform.ANDROID && peerPlatform == Platform.IOS &&
+            senderCaps and DeviceCaps.CAP_HOTSPOT_HOST != 0 &&
+            peerCaps and DeviceCaps.CAP_HOTSPOT_CLIENT != 0) {
+            return dataLink(LinkType.HOTSPOT)
         }
-
-        return LinkType.LAN
+        return TransportSelection.Unavailable
     }
 
-    fun isSameSubnet(ip1: String, ip2: String, prefixLength: Int = 24): Boolean {
-        return try {
-            val p1 = ip1.split(".").map { it.toInt() }
-            val p2 = ip2.split(".").map { it.toInt() }
-            if (p1.size != 4 || p2.size != 4) return false
+    fun isSameSubnet(ip1: String, ip2: String, prefixLength: Int): Boolean {
+        if (prefixLength !in 0..32) return false
+        val address1 = parseIpv4(ip1) ?: return false
+        val address2 = parseIpv4(ip2) ?: return false
+        val mask = if (prefixLength == 0) 0 else -1 shl (32 - prefixLength)
+        return (address1 and mask) == (address2 and mask)
+    }
 
-            val int1 = (p1[0] shl 24) or (p1[1] shl 16) or (p1[2] shl 8) or p1[3]
-            val int2 = (p2[0] shl 24) or (p2[1] shl 16) or (p2[2] shl 8) or p2[3]
-
-            val mask = if (prefixLength == 0) 0 else (-1 shl (32 - prefixLength))
-            (int1 and mask) == (int2 and mask)
-        } catch (_: Exception) {
-            false
+    private fun parseIpv4(ip: String): Int? {
+        val octets = ip.split('.')
+        if (octets.size != 4) return null
+        var result = 0
+        for (octet in octets) {
+            if (octet.isEmpty() || octet.length > 3 || octet.any { it !in '0'..'9' }) return null
+            val value = octet.toIntOrNull() ?: return null
+            if (value !in 0..255) return null
+            result = (result shl 8) or value
         }
+        return result
     }
 }

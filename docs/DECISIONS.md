@@ -278,3 +278,61 @@
   connection. The existing 256 MiB real TCP disconnect/reconnect test still passes.
 - Real Android transport wiring remains later remediation work. Step 10's
   1 GiB / 256 MiB heap acceptance criterion is not claimed here.
+
+## [Step 10] 1 GiB transfer under a 256 MiB JVM test heap
+- core:jvmTest now sets maxHeapSize = "256m" and maxParallelForks = 1. The full
+  core suite, including real parallel/reconnect tests, runs inside that limit.
+- Step10LargeTransferTest verifies Runtime.maxMemory is at most 256 MiB before
+  starting, so running it with a larger heap cannot produce a false memory proof.
+- The test creates exactly 1,073,741,824 source bytes with a reusable 1 MiB buffer
+  and streaming SHA-256. Block-specific prefixes expose reordered/duplicated data.
+- The real sender reads a DiskFileSource; the real receiver writes a DiskFileSink
+  and persists bitmaps through DiskResumeStore. Four authenticated real TCP
+  connections carry the file with the production default request window.
+- The test asserts all four sockets carry data, exactly 256 unique chunk indices
+  and 1 GiB of plaintext cross them, the destination has the exact length and
+  streaming SHA-256, the source closes once, both machines emit Done once, all
+  sockets close and partial/resume files are removed after successful completion.
+- No explicit GC, skipped test or larger-heap override is used. The existing
+  256 MiB disconnect/reconnect and four-socket corruption/retry tests also run
+  under the same test-process heap limit.
+- Heap usage sampled during frame IO is diagnostic, not an exact peak measure.
+  This acceptance proves the JVM heap cap; it is not a native/RSS memory or
+  Android-device memory/performance measurement.
+- About 2 GiB of temporary disk is required for source plus destination. Temporary
+  files are removed in finally; the acceptance test has a five-minute deadline.
+
+
+## [Step 11] Sender-owned transport selection and shared TCP adapter
+- SenderStateMachine.selectTransport is a query allowed during AwaitAccept, after
+  a valid CLAIM. It uses the sender's actual offered file sizes and the peer's
+  HelloMessage platform/capabilities; it does not advance state or start a link.
+- Selection returns BleOnly, DataLink(type), or Unavailable. No-common-link and
+  BLE-only are distinct, and no fallback invents LAN or sender-only Wi-Fi Direct.
+- Small means strictly below 64 * 1024 bytes, including an empty payload. Both
+  peers must advertise CAP_BLE; otherwise normal data-link selection is attempted.
+  Exactly 64 KiB uses a data link. Negative sizes are rejected.
+- Large-payload priorities remain same LAN, Android/Android Wi-Fi Direct,
+  iOS/iOS MPC, then Android-sender/iOS-receiver hotspot. Each option checks the
+  relevant capability on both peers. Hotspot requires sender HOST and peer CLIENT;
+  reverse iOS-sender hotspot orchestration is outside the architecture's scope.
+- LAN requires both LAN caps, both IPv4 addresses and an explicit sender interface
+  prefix. Missing metadata skips LAN. IPv4 octets and prefixes 0..32 are validated;
+  /16 and /23 are supported without any /24 assumption. IPv6 selection is deferred.
+- AndroidSenderTransportSelector reads ConnectivityManager.activeNetwork and that
+  network's LinkProperties LinkAddress/prefixLength on every query. Only active
+  Wi-Fi/Ethernet IPv4 metadata is used; VPN/cellular/no network yields no LAN address.
+  The existing ACCESS_NETWORK_STATE permission is sufficient for this metadata.
+- Android glue delegates policy to the core sender. BLE HELLO delivery and the
+  MainActivity caller remain Step 12; peerIp must be supplied by known peer network
+  metadata, never guessed from an SSID, a default gateway or a hardcoded address.
+  LINK_INFO creation/encryption remains Step 14. BLE-only selection does not claim
+  that the later small-payload BLE transfer implementation is complete.
+- LanTransport connect/accept share TcpConnection. Failed/cancelled connects close
+  their socket. WifiDirectTransport delegates TCP operations to LanTransport;
+  actual WifiP2pManager group ownership/lifecycle remains Step 16.
+- Removed six empty README.kt files and unused CrossPlatformTransferManager and
+  CrossPlatformBridge stubs, including their fabricated hotspot join credentials.
+  The credential data used by AndroidHotspotManager stays in HotspotCredentials.kt
+  with explicit values. The earlier Step 2 note about the removed manager is historical.
+- No dependency, BLE wire message, frame numbering or session timeout changed.

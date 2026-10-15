@@ -8,6 +8,9 @@ import com.yodrop.core.platform.FileSource
 import com.yodrop.core.protocol.*
 import com.yodrop.core.transfer.ChunkPlanner
 import com.yodrop.core.transport.Connection
+import com.yodrop.core.transport.LanAddress
+import com.yodrop.core.transport.TransportSelection
+import com.yodrop.core.transport.TransportSelector
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -173,6 +176,29 @@ class SenderStateMachine(
             }
             true
         }
+
+    /** Query after CLAIM, before link setup. Peer capabilities come from its HELLO. */
+    suspend fun selectTransport(
+        senderPlatform: Platform,
+        senderCapabilities: Int,
+        peer: HelloMessage,
+        senderLan: LanAddress? = null,
+        peerIp: String? = null
+    ): TransportSelection = eventMutex.withLock {
+        check(_state.value is SenderState.AwaitAccept) {
+            "Transport selection requires a claimed sender awaiting acceptance"
+        }
+        TransportSelector.selectTransport(
+            senderPlatform = senderPlatform,
+            peerPlatform = peer.platform,
+            senderCaps = senderCapabilities,
+            peerCaps = peer.capabilities,
+            senderIp = senderLan?.ip,
+            peerIp = peerIp,
+            totalBytes = filesToSend.sumOf { it.size },
+            senderPrefixLength = senderLan?.prefixLength
+        )
+    }
 
     suspend fun onDecisionReceived(
         decision: DecisionMessage,
