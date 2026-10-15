@@ -23,7 +23,7 @@ import com.yodrop.core.session.SenderStateMachine
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.InputStream
+import java.io.IOException
 import java.security.MessageDigest
 
 class MainActivity : ComponentActivity() {
@@ -34,11 +34,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Sender State Machine
         senderMachine = SenderStateMachine(lifecycleScope)
 
-        // Receiver State Machine with Real Android Scoped-Storage FileSink Factory
-        // Never throws NotImplementedError when chunks or transfers begin
         receiverMachine = ReceiverStateMachine(
             scope = lifecycleScope,
             sinkFactory = { meta -> createScopedStorageFileSink(meta) }
@@ -53,7 +50,6 @@ class MainActivity : ComponentActivity() {
                 receiverState = receiverState,
                 onSendClick = { startSampleSendFlow() },
                 onReceiveClick = {
-                    // Safe receive initiation: Scan and transition cleanly without crash
                     receiverMachine.startScanning()
                 },
                 onAcceptClick = {
@@ -87,11 +83,6 @@ class MainActivity : ComponentActivity() {
         senderMachine.onGrabbed(listOf(meta), mapOf(meta.id to source))
     }
 
-    /**
-     * Creates a streaming FileSink strictly following Android scoped storage.
-     * Chunks are written directly to an app-private cache/temp file without loading
-     * the full file into memory. On commit(), it publishes safely to MediaStore.Downloads.
-     */
     private fun createScopedStorageFileSink(meta: FileMeta): FileSink {
         val tempFile = File(cacheDir, "yodrop_recv_${meta.id}.part")
         val baseSink = DiskFileSink(meta.id, tempFile)
@@ -109,6 +100,7 @@ class MainActivity : ComponentActivity() {
 
             override suspend fun commit() {
                 baseSink.commit()
+                // Strict publish: will throw on error and will NEVER delete tempFile on failure
                 publishToMediaStore(tempFile, meta.name, meta.mime)
             }
 
@@ -118,12 +110,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * Publishes a fully verified file into MediaStore Downloads using streaming buffers
-     * to avoid memory spikes (max buffer 64KB).
-     */
+    @Throws(IOException::class)
     private fun publishToMediaStore(sourceFile: File, displayName: String, mimeType: String) {
-        if (!sourceFile.exists()) return
+        if (!sourceFile.exists()) {
+            throw IOException("Source file does not exist: ${sourceFile.absolutePath}")
+        }
+
+        var publishedSuccessfully = false
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
@@ -133,26 +126,40 @@ class MainActivity : ComponentActivity() {
                     put(MediaStore.Downloads.IS_PENDING, 1)
                 }
                 val resolver = contentResolver
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
-                resolver.openOutputStream(uri)?.use { out ->
-                    FileInputStream(sourceFile).use { input ->
-                        val buffer = ByteArray(64 * 1024)
-                        var read: Int
-                        while (input.read(buffer).also { read = it } != -1) {
-                            out.write(buffer, 0, read)
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IOException("Failed to insert MediaStore download record for $displayName")
+
+                try {
+                    resolver.openOutputStream(uri)?.use { out ->
+                        FileInputStream(sourceFile).use { input ->
+                            val buffer = ByteArray(64 * 1024)
+                            var read: Int
+                            while (input.read(buffer).also { read = it } != -1) {
+                                out.write(buffer, 0, read)
+                            }
+                            out.flush()
                         }
-                        out.flush()
+                    } ?: throw IOException("Failed to open output stream for URI: $uri")
+
+                    values.clear()
+                    values.put(MediaStore.Downloads.IS_PENDING, 0)
+                    val updatedRows = resolver.update(uri, values, null, null)
+                    if (updatedRows <= 0) {
+                        throw IOException("Failed to finalize pending status for URI: $uri")
                     }
+                    publishedSuccessfully = true
+                } catch (e: Exception) {
+                    resolver.delete(uri, null, null)
+                    throw e
                 }
-                values.clear()
-                values.put(MediaStore.Downloads.IS_PENDING, 0)
-                resolver.update(uri, values, null, null)
             } else {
                 val targetDir = File(
                     Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
                     "YoDrop"
                 )
-                targetDir.mkdirs()
+                if (!targetDir.exists() && !targetDir.mkdirs()) {
+                    throw IOException("Failed to create target directory: ${targetDir.absolutePath}")
+                }
                 val destFile = File(targetDir, displayName)
                 FileInputStream(sourceFile).use { input ->
                     FileOutputStream(destFile).use { out ->
@@ -164,13 +171,16 @@ class MainActivity : ComponentActivity() {
                         out.flush()
                     }
                 }
+                publishedSuccessfully = true
             }
-        } catch (_: Exception) {
-            // Best effort publishing
-        } finally {
-            if (sourceFile.exists()) {
+
+            // ONLY delete the temporary file after verified, successful publish
+            if (publishedSuccessfully) {
                 sourceFile.delete()
             }
+        } catch (t: Throwable) {
+            // Keep sourceFile intact on disk for recovery
+            throw if (t is IOException) t else IOException("Publishing failed for $displayName", t)
         }
     }
 }
