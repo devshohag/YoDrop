@@ -56,3 +56,12 @@
   - Bitmap state is stored per `{sessionId, fileId}`.
   - Upon reconnection, receiver loads the existing bitmap and requests only unreceived chunks.
   - State file is deleted once file integrity is verified and committed.
+
+## [T7] Parallel TCP Pipelining, NACK, & Keep-Alive Handlers
+- **Decision**: Multi-socket parallel streams (2–4 connections) per transfer session.
+- **Wire Control Additions**:
+  - `ACK (0x0A)`: Explicit chunk delivery confirmation.
+  - `NACK (0x0B)`: Signals damaged or missing chunk indices, triggering immediate priority retransmission.
+  - `PING (0x08)` / `PONG (0x09)`: Senders automatically echo PING with PONG to maintain active socket liveness.
+- **Synchronization**:
+  - A single `ChunkBitmap` protected by concurrency primitives coordinates parallel TCP worker routines without chunk collision or duplicate downloads.

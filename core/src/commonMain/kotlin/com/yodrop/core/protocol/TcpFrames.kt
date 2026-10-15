@@ -14,12 +14,14 @@ object FrameType {
     const val CANCEL: Byte = 0x07
     const val PING: Byte = 0x08
     const val PONG: Byte = 0x09
+    const val ACK: Byte = 0x0A
+    const val NACK: Byte = 0x0B
 }
 
 class RawFrame(val type: Byte, val payload: ByteArray) {
     companion object {
-        const val MAX_FRAME_SIZE = 4 * 1024 * 1024 + 1024 // 4 MiB + 1 KiB cap
-        const val MIN_FRAME_SIZE = 1 // 1 byte for frame type
+        const val MAX_FRAME_SIZE = 4 * 1024 * 1024 + 1024
+        const val MIN_FRAME_SIZE = 1
 
         fun decode(bytes: ByteArray): RawFrame {
             require(bytes.size >= 5) { "Frame is too short: ${bytes.size} bytes" }
@@ -29,9 +31,9 @@ class RawFrame(val type: Byte, val payload: ByteArray) {
                     (bytes[3].toInt() and 0xFF)
 
             require(length in MIN_FRAME_SIZE..MAX_FRAME_SIZE) {
-                "Frame length $length is outside allowed bounds [$MIN_FRAME_SIZE, $MAX_FRAME_SIZE]"
+                "Frame length $length is outside allowed bounds [$MIN_FRAME_SIZE,$MAX_FRAME_SIZE]"
             }
-            require(bytes.size == length + 4) { "Payload size mismatch: expected ${length + 4}, got ${bytes.size}" }
+            require(bytes.size == length + 4) { "Payload size mismatch: expected ${length + 4}, got${bytes.size}" }
 
             val type = bytes[4]
             val payload = bytes.copyOfRange(5, bytes.size)
@@ -115,6 +117,18 @@ data class AuthMessage(
 
 @Serializable
 data class ChunkReqMessage(
+    val fileId: String,
+    val chunkIndices: List<Int>
+)
+
+@Serializable
+data class AckMessage(
+    val fileId: String,
+    val chunkIndex: Int
+)
+
+@Serializable
+data class NackMessage(
     val fileId: String,
     val chunkIndices: List<Int>
 )
