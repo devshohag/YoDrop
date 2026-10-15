@@ -56,3 +56,16 @@ Only after that command is green, commit this step as:
 
 API 29 crypto instrumentation is still pending from Step 3. Atomic disk resume,
 large kill/reconnect acceptance and real parallel receiver remain Steps 8 and 9.
+
+
+## Owner verification received after the Step 7 patch
+
+The owner ran the combined clean JVM-test + Android-assemble command on Windows:
+
+```text
+BUILD SUCCESSFUL in 1m 30s
+61 actionable tasks: 61 executed
+```
+
+This resolves the Step 7 dual-build pending item above. The owner then pushed
+Step 7 as cbd514134c469ec456b3dbc550a9233972058dec before Step 8 began.

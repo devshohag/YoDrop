@@ -185,3 +185,51 @@
 - Step 8 still owns atomic/forced bitmap persistence, crash recovery validation
   and the >=256 MiB real-TCP kill-at-40-percent acceptance test. Step 9 owns the
   real parallel receiver; this step does not claim either acceptance criterion.
+
+## [Step 8] Durable atomic resume and real TCP recovery
+- Receiver now calls FileSink.force() before marking a chunk received and saving
+  its bitmap. JVM/Android disk sinks use FileChannel.force(true).
+- DiskResumeStore writes a unique temporary file in the destination directory,
+  forces it, then replaces the bitmap with ATOMIC_MOVE + REPLACE_EXISTING.
+  Unsupported atomic replacement fails; it never falls back to an in-place write.
+  Temporary files from completed/failed saves are removed. Load/save/clear calls
+  on a store instance are serialized with a Mutex; records retain their raw format.
+- Directory metadata is forced where supported. Directory force is best effort
+  on filesystems/platforms that cannot open/force directories, including Windows;
+  bitmap file force and atomic replacement remain mandatory.
+- Bitmap loads reject unexpected lengths before reading, bounding allocation and
+  rejecting torn/oversized records rather than trusting their received bits.
+- Before using stored bits, receiver checks that the sink contains bytes through
+  the end of the highest marked chunk. Missing/truncated partial data resets all
+  bits and clears the persisted record before requesting chunks again.
+- FileSink.hasDataThrough conservatively rejects nonempty stored progress by
+  default. Memory and disk sinks implement actual length checks; Android's scoped
+  storage wrapper forwards force and resume validation to its disk sink.
+- Disk sinks close/reopen stale handles after partial-file loss and do not create
+  a new .part while closing an unused/already committed sink.
+- Checksum mismatch discards partial data and clears bitmap state before peer
+  notification; notification failure still leaves a terminal failure.
+- Step8ResumeTest streams 256 MiB over real TCP, drops both sockets after chunk
+  26/64 is forced and persisted (40.625%), reattaches the same machines, verifies
+  both peers re-AUTH and that exactly 38 missing chunks / 159,383,552 plaintext
+  bytes cross the second connection, and compares the final SHA-256.
+- Separate real-TCP crash fixtures seed received bits with truncated/missing
+  .part files, verify both chunks are requested again, and compare final SHA-256.
+- This restores a live session after connection loss; process-restart restoration
+  of session keys/user consent is not implemented. Real parallel receiver remains
+  Step 9; the 1 GiB / 256 MiB heap acceptance test remains Step 10.
+
+
+### Step 8 Windows concurrent-reader correction
+- Owner's Windows run passed the 256 MiB kill/reconnect test but failed the
+  concurrent snapshot test while its raw FileInputStream reader opened a path
+  during replacement (FileNotFoundException). Step 8 is not yet dual-build green.
+- All DiskResumeStore instances for one canonical directory now share a Mutex
+  within the process. Application readers, writers and clear operations use it.
+- Bitmap loading uses one NIO FileChannel for both size validation and bounded
+  reads; missing records return an empty bitmap via NoSuchFileException.
+- The concurrent test uses the production loader through a separate store instance
+  and an equivalent directory spelling, retaining the exact old-or-new byte assertion.
+  Both valid snapshots are nonempty so a missing-record fallback cannot pass.
+  No retry, sleep, ignored IO failure or non-atomic write fallback was introduced.
+- This process-local gate does not coordinate independent external writer processes.

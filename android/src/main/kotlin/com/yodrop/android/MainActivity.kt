@@ -223,6 +223,11 @@ class MainActivity : ComponentActivity() {
                 baseSink.writeChunk(offset, data)
             }
 
+            override suspend fun force() = baseSink.force()
+
+            override suspend fun hasDataThrough(length: Long): Boolean =
+                baseSink.hasDataThrough(length)
+
             override suspend fun verifySha256(expectedSha256: ByteArray): Boolean {
                 return baseSink.verifySha256(expectedSha256)
             }

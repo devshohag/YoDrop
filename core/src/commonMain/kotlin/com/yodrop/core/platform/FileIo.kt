@@ -15,6 +15,10 @@ interface FileSink {
     val fileId: String
     suspend fun writeChunk(offset: Long, data: ByteArray)
     suspend fun verifySha256(expectedSha256: ByteArray): Boolean
+    /** Make preceding writes durable before persisting received bits. */
+    suspend fun force() {}
+    /** Unknown sink implementations conservatively reject stored progress. */
+    suspend fun hasDataThrough(length: Long): Boolean = length == 0L
     suspend fun commit(): Unit
     /** Discard uncommitted partial data on a terminal session. */
     suspend fun discard() { close() }
@@ -80,6 +84,10 @@ class MemoryFileSink(
             CryptoEngine.sha256(snapshot),
             expectedSha256
         )
+    }
+
+    override suspend fun hasDataThrough(length: Long): Boolean = mutex.withLock {
+        length >= 0 && length <= writtenSize.toLong()
     }
 
     override suspend fun discard() {

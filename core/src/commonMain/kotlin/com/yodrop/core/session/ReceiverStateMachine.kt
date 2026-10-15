@@ -298,7 +298,7 @@ class ReceiverStateMachine(
 
         for ((fileIdx, file) in manifest.files.withIndex()) {
             val totalChunks = ChunkPlanner.calculateTotalChunks(file.size, manifest.chunkSize)
-            val bitmap = resumeStore.loadBitmap(sid, file.id, totalChunks)
+            var bitmap = resumeStore.loadBitmap(sid, file.id, totalChunks)
             if (!setState(ReceiverState.Receiving(
                     fileIdx.toFloat() / manifest.files.size, file.name
                 ))) return
@@ -309,6 +309,15 @@ class ReceiverStateMachine(
                 continue
             }
             val sink = sinks.getOrPut(file.id) { sinkFactory(file) }
+            var requiredLength = 0L
+            for (index in 0 until totalChunks) {
+                if (bitmap.isReceived(index)) requiredLength =
+                    ChunkPlanner.getChunkByteRange(index, file.size, manifest.chunkSize).second
+            }
+            if (!sink.hasDataThrough(requiredLength)) {
+                bitmap = ChunkBitmap(totalChunks)
+                resumeStore.clear(sid, file.id)
+            }
 
             while (!bitmap.isComplete()) {
                 val missing = bitmap.getMissingChunks(batchSize = 16)
@@ -369,8 +378,8 @@ class ReceiverStateMachine(
                     }
                     val start = chunkStart
                     sink.writeChunk(start, plaintext)
+                    sink.force()
                     bitmap.markReceived(chunkIdx)
-
                     resumeStore.saveBitmap(sid, file.id, bitmap)
 
                     val fileProgress = (fileIdx + (chunkIdx + 1).toFloat() / totalChunks.toFloat()) / manifest.files.size.toFloat()
@@ -382,12 +391,22 @@ class ReceiverStateMachine(
             val matches = sink.verifySha256(file.sha256)
 
             if (!matches) {
-                connection.writeFrame(
-                    ProtocolCodec.encodeToFrame(
+                // Never retain a corrupt bitmap/part, even if notifying the peer fails.
+                withContext(NonCancellable) {
+                    sink.discard()
+                    sink.close()
+                    sinks.remove(file.id)
+                    resumeStore.clear(sid, file.id)
+                }
+                try {
+                    connection.writeFrame(ProtocolCodec.encodeToFrame(
                         FrameType.FILE_DONE, FileDoneMessage(file.id, false)
-                    )
-                )
-                fail("Checksum mismatch for file ${file.name}")
+                    ))
+                } finally {
+                    withContext(NonCancellable) {
+                        fail("Checksum mismatch for file ${file.name}")
+                    }
+                }
                 return
             }
             sink.commit()

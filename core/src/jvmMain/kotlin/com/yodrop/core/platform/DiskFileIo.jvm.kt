@@ -43,21 +43,41 @@ class DiskFileSink(
         get() = checkNotNull(committedTarget) { "File has not been committed" }
 
     private val partFile = File(targetFile.parentFile ?: File("."), "${targetFile.name}.part")
-    private val raf: RandomAccessFile by lazy {
-        partFile.parentFile?.mkdirs()
-        RandomAccessFile(partFile, "rw")
-    }
+    private val fileLock = Any()
+    private var handle: RandomAccessFile? = null
+    private val raf: RandomAccessFile
+        get() = handle ?: run {
+            partFile.parentFile?.mkdirs()
+            RandomAccessFile(partFile, "rw").also { handle = it }
+        }
 
     override suspend fun writeChunk(offset: Long, data: ByteArray) = withContext(Dispatchers.IO) {
-        synchronized(raf) {
+        synchronized(fileLock) {
             raf.seek(offset)
             raf.write(data)
         }
     }
 
+    override suspend fun force() = withContext(Dispatchers.IO) {
+        synchronized(fileLock) { raf.channel.force(true) }
+    }
+
+    override suspend fun hasDataThrough(length: Long): Boolean = withContext(Dispatchers.IO) {
+        require(length >= 0)
+        synchronized(fileLock) {
+            val valid = length == 0L || (partFile.isFile && partFile.length() >= length)
+            if (!valid || !partFile.exists()) {
+                // A removed/replaced path must not leave writes targeting an orphaned handle.
+                handle?.close()
+                handle = null
+            }
+            valid
+        }
+    }
+
     override suspend fun verifySha256(expectedSha256: ByteArray): Boolean = withContext(Dispatchers.IO) {
         val digest = MessageDigest.getInstance("SHA-256")
-        synchronized(raf) {
+        synchronized(fileLock) {
             raf.seek(0)
             val buffer = ByteArray(64 * 1024)
             var bytesRead: Int
@@ -70,9 +90,11 @@ class DiskFileSink(
     }
 
     override suspend fun commit(): Unit = withContext(Dispatchers.IO) {
-        synchronized(raf) {
+        synchronized(fileLock) {
             if (committedTarget != null) return@synchronized
+            raf.channel.force(true)
             raf.close()
+            handle = null
 
             val parent = targetFile.parentFile ?: File(".")
             val dot = targetFile.name.lastIndexOf('.')
@@ -109,7 +131,10 @@ class DiskFileSink(
     }
 
     override suspend fun close() = withContext(Dispatchers.IO) {
-        runCatching { raf.close() }
+        synchronized(fileLock) {
+            handle?.close()
+            handle = null
+        }
         Unit
     }
 }
