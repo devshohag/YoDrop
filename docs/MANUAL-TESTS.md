@@ -43,13 +43,79 @@ and grant the requested Bluetooth permissions (location for scanning on API 29/3
 | Deny reached both terminal outcomes | PENDING |
 | Cancel/reset allowed a new handshake | PENDING |
 
-Known dependency: Step 13 has not yet implemented server CCCD subscription,
-callback-paced operation queues, negotiated MTU or per-peer fragment state.
-These can block notification delivery even when codec/controller unit tests pass.
-If the OFFER/codes do not arrive, record BLOCKED and the observed behavior; do not
-mark pairing PASS. Rerun this checklist after Step 13's GATT work. The Step 12
+Step 13 now implements server CCCD subscription, callback-paced operation queues,
+negotiated MTU and per-peer fragment state. This checklist must still be executed
+on physical phones. If the OFFER/codes do not arrive, record FAIL/BLOCKED and the
+observed behavior; do not infer pairing PASS from build/tests. The Step 12
 physical-phone acceptance criterion remains pending until model/version and the
 matching-code result are recorded.
+
+## Step 13: exact 1 KiB request/reply over GATT
+
+Status: **PENDING - no physical-device output recorded.** Use two physical phones
+and the same debug APK. This is a GATT diagnostic, not a bulk file transfer.
+The harness is opt-in and ignored by release builds. It sends an exact 1024-byte
+typed request and verifies an exact 1024-byte reply with the same token. Its dummy
+endpoint never enters the session machines. No credentials or payload are logged.
+
+Run `adb devices`, replace both serial placeholders, then execute in PowerShell:
+
+```powershell
+$senderPhone = 'SENDER_SERIAL'
+$receiverPhone = 'RECEIVER_SERIAL'
+foreach ($phone in @($senderPhone, $receiverPhone)) {
+    adb -s $phone install -r .\android\build\outputs\apk\debug\android-debug.apk
+    adb -s $phone shell am force-stop com.yodrop.android
+    adb -s $phone logcat -c
+    adb -s $phone shell am start -n com.yodrop.android/.MainActivity `
+        --ei yodrop_ble_mtu 23 --ez yodrop_gatt_probe true
+}
+```
+
+1. Grant permissions and enable Bluetooth on both phones. Sender chooses a file
+   (at least 64 KiB); receiver taps Receive. The client sends the probe automatically
+   after subscription/HELLO. Do not count the normal CLAIM or small HELLO as a 1 KiB
+   probe. Keep both apps foreground.
+2. Capture receiver logs and require **GATT_PROBE PASS requestBytes=1024
+   replyBytes=1024 actualMtu=23**, plus CCCD confirmation:
+
+```powershell
+adb -s $receiverPhone logcat -d -s 'YoDropBLE:D' '*:S'
+adb -s $senderPhone logcat -d -s 'YoDropBLE:D' '*:S'
+```
+
+3. Force-stop both apps, clear logs and repeat the launch script with
+   `--ei yodrop_ble_mtu 247`. Repeat file selection/Receive. Require a new PASS line
+   and record actual MTU. Android 14+ can choose **517** for the first MTU request;
+   a request for 247 does not prove MTU 247. Record 517 separately and leave exact
+   247 pending unless a device pair actually negotiates 247.
+4. Disable diagnostics by force-stopping both apps and launching without either
+   extra. Repeat Step 12's full OFFER / tap CLAIM / matching codes / ACCEPT / DENY
+   checklist. Reset/retry after a BLE disconnect; do not expect automatic adoption
+   of a different advertising phone.
+5. With three phones available, advertise from two senders and verify that receiver
+   remains pinned to its first selected peer/session and does not mix messages.
+   Record selected peer names and observations; this is supplementary to the
+   deterministic per-peer isolation unit test.
+
+| Device test | Models / Android versions | Actual MTU | Result / log |
+| --- | --- | --- | --- |
+| 1024-byte request + reply, requested MTU 23 | Not recorded | Not recorded | PENDING |
+| 1024-byte request + reply, requested MTU 247 | Not recorded | Not recorded | PENDING |
+| Optional Android 14+ MTU 517 result | Not recorded | Not recorded | PENDING |
+| Step 12 matching codes after GATT fixes | Not recorded | Not applicable | PENDING |
+| Disconnect/reset then new handshake | Not recorded | Not recorded | PENDING |
+
+Record manufacturer/model and Android/API using Settings or:
+
+```powershell
+adb -s $senderPhone shell getprop ro.product.model
+adb -s $senderPhone shell getprop ro.build.version.release
+adb -s $senderPhone shell getprop ro.build.version.sdk
+```
+
+Repeat for receiver. A missing PASS line, timeout, mismatched bytes or wrong actual
+MTU is not a pass. Save the observed error and rerun after correction.
 
 ## Other pending physical checks
 

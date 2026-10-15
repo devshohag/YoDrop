@@ -91,7 +91,11 @@ class MainActivity : ComponentActivity() {
                     DeviceCaps.CAP_WIFI_DIRECT else 0),
             deviceId = persistentDeviceId()
         )
-        ble = AndroidBleManager(this, lifecycleScope, hello)
+        val debug = applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+        val bleMtu = if (debug) intent.getIntExtra("yodrop_ble_mtu", 247)
+            .takeIf { it in 23..517 } ?: 247 else 247
+        ble = AndroidBleManager(this, lifecycleScope, hello, requestedMtu = bleMtu,
+            diagnosticsEnabled = debug && intent.getBooleanExtra("yodrop_gatt_probe", false))
         val selector = AndroidSenderTransportSelector(this, senderMachine)
         handshake = BleHandshakeController(senderMachine, receiverMachine, hello,
             selectTransport = { peer -> selector.selectTransport(hello.capabilities, peer) }

@@ -377,3 +377,57 @@
   LINK_INFO dispatcher in this step is not a claim of credential confidentiality.
   Small BLE payload transfer, Wi-Fi Direct/hotspot data setup and bulk Android
   transfer remain their later steps. No dependency or TCP wire/timeouts changed.
+
+## [Step 13] Callback-paced GATT and bounded peer fragments
+- GattOperationQueue allows one platform operation in flight across the manager.
+  Service add, MTU request, service discovery, CCCD writes, characteristic writes
+  and notifications wait for their matching connection/operation callback. Immediate
+  start rejection returns without waiting; MTU rejection/failed callback keeps the
+  default 23. Other failed operations retire the link. A missing callback fails
+  after ten seconds. The fixed delay(15) throttle is removed.
+- Timeout, disconnect or cancellation of an in-flight operation closes that queue.
+  Android closes the control links and increments a generation before creating a
+  replacement queue. Callback objects capture the old generation/queue; client
+  callbacks also match the exact active BluetoothGatt. No silent switch to a new
+  peer or reuse of ambiguous late callbacks is attempted. The user resets/retries
+  the control handshake. This conservative policy is for single-receiver BLE
+  control; data-socket resume behavior from Steps 7-10 is unchanged.
+- Mutable Android link state is confined to Main. Binder callbacks marshal onto
+  it. The sender advertises only after onServiceAdded confirms its GATT service.
+  Stopping discovery/advertising retains established GATT for CLAIM/ACCEPT.
+- Notify characteristic has a per-peer CCCD (0x2902), read/write responses and
+  explicit enable/disable validation. Client waits for service discovery and a
+  successful CCCD write before HELLO. Server rejects writes before subscription.
+  Every notify waits for onNotificationSent; every write uses WRITE_TYPE_DEFAULT
+  and waits for onCharacteristicWrite. API 33+ sends immutable value arrays;
+  older API calls remain only in their guarded compatibility branches.
+- Actual MTU is tracked per peer, defaults to 23, and updates from callbacks.
+  GATT value capacity is min(MTU - 3, 512); the four-byte fragment header is then
+  subtracted. Android 14+ can negotiate 517 despite requesting 247, so diagnostics
+  record the actual value rather than assuming the request was honored.
+- The existing fragment(msgId,data,mtu) argument remains value/packet capacity for
+  source compatibility; Android now supplies packetSizeForMtu(actualMtu). It never
+  passes an ATT MTU directly. u16 IDs, value bounds and the 255-fragment limit are
+  checked before transmission. Large messages can therefore be rejected at MTU 23
+  even when within the codec's 16 KiB cap; the wire header is unchanged.
+- Each connected peer has a separate bounded Reassembler. It validates total>0,
+  index<total and consistent totals, accepts out-of-order/identical duplicate
+  fragments, discards conflicting duplicates/oversized assemblies and copies input
+  data. Partial messages expire ten seconds from their first fragment, independent
+  of slow duplicate traffic. A one-second reaper releases idle stale buffers.
+  Disconnect clears MTU, subscription and fragment state; at most 16 peers exist.
+- Receive mode pins the first qualifying advertisement's peer and 16-byte session
+  hint until reset. Subsequent scan callbacks cannot replace it; full OFFER must
+  match its advertised session. This preserves the existing first-offer tap flow,
+  rather than adding a separate pre-connection device-picker UI. Scan callback
+  generations reject events from retired scans. activeGattClient is reset on loss.
+- Debug APKs can opt in through yodrop_gatt_probe/yodrop_ble_mtu intent extras.
+  A reserved diagnostic marker in an existing typed LINK_INFO payload carries an
+  exact 1024-byte request and reply with a random token, echoed only in diagnostic
+  mode. These probes are consumed below the session controller and never become
+  link endpoints, including when diagnostics are disabled. No new wire tag or
+  dependency is added. Release builds ignore these intent options; default debug
+  runs also keep the probe disabled. Only role, MTU and byte counts are logged.
+- Physical two-phone code matching and 1 KiB GATT round trips at MTU 23/247 remain
+  pending until docs/MANUAL-TESTS.md records actual devices, MTUs and logs. JVM tests
+  and Android compilation do not establish those device acceptance results.
