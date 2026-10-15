@@ -1,4 +1,6 @@
-﻿package com.yodrop.core
+package com.yodrop.core
+
+import kotlinx.coroutines.flow.first
 
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.platform.DiskFileSink
@@ -65,10 +67,14 @@ class T6PersistentResumeTest {
             val source = DiskFileSource(meta.id, srcFile)
 
             // Step 1: Pre-seed resume store with chunk 0 already completed (simulating prior partial transfer)
+            val sender = SenderStateMachine(this)
+            sender.onGrabbed(listOf(meta), mapOf(meta.id to source))
+            val realOffer = (sender.state.value as SenderState.Advertising).offer
+            val fixedSid = realOffer.sessionId
             val totalChunks = 2
-            val preBitmap = resumeStore.loadBitmap(ByteArray(16) { 1 }, meta.id, totalChunks)
+            val preBitmap = resumeStore.loadBitmap(fixedSid, meta.id, totalChunks)
             preBitmap.markReceived(0)
-            resumeStore.saveBitmap(ByteArray(16) { 1 }, meta.id, preBitmap)
+            resumeStore.saveBitmap(fixedSid, meta.id, preBitmap)
 
             // Also write chunk 0 directly to sink to simulate disk state from first session
             val sink = DiskFileSink(meta.id, dstFile)
@@ -80,20 +86,7 @@ class T6PersistentResumeTest {
             val server = createPlatformServerSocket(0)
             val port = server.localPort
 
-            val sender = SenderStateMachine(this)
             val receiver = ReceiverStateMachine(this, resumeStore = resumeStore, sinkFactory = { DiskFileSink(it.id, dstFile) })
-
-            // Override sessionId to match pre-seeded resume key
-            val fixedSid = ByteArray(16) { 1 }
-            sender.onGrabbed(listOf(meta), mapOf(meta.id to source))
-            sender.sessionId = fixedSid
-            val realOffer = com.yodrop.core.protocol.OfferMessage(
-                sessionId = fixedSid,
-                senderPubKey = (sender.state.value as SenderState.Advertising).offer.senderPubKey,
-                fileCount = 1,
-                totalBytes = testFileSize,
-                previewName = "resume_source.dat"
-            )
 
             receiver.startScanning()
             receiver.onOfferDiscovered(realOffer)
@@ -101,6 +94,7 @@ class T6PersistentResumeTest {
             sender.onClaimReceived(claim)
 
             val linkInfo = LinkInfoMessage(LinkType.LAN, "127.0.0.1", port)
+            receiver.state.first { it is ReceiverState.AcceptPrompt }
             val decision = receiver.acceptTransfer(linkInfo)
             sender.onDecisionReceived(decision, linkInfo)
 

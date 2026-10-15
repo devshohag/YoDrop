@@ -1,4 +1,4 @@
-﻿package com.yodrop.core
+package com.yodrop.core
 
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.protocol.FileMeta
@@ -7,16 +7,17 @@ import com.yodrop.core.session.SenderStateMachine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlin.test.Test
+import kotlinx.coroutines.test.runTest
 import kotlin.test.assertEquals
 
 class T1RandomSessionIdTest {
 
     @Test
-    fun testGenerate1000DistinctSessionIds() {
+    fun testGenerate1000DistinctSessionIds() = runTest {
         val count = 1000
         val set = mutableSetOf<String>()
         val dummyFile = FileMeta("id", "name", 100L, "text/plain", ByteArray(32))
-        val scope = CoroutineScope(Dispatchers.Unconfined)
+        val scope = backgroundScope
 
         for (i in 0 until count) {
             val sm = SenderStateMachine(scope)

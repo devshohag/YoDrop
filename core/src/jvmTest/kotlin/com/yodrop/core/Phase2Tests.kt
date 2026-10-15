@@ -1,4 +1,6 @@
-﻿package com.yodrop.core
+package com.yodrop.core
+
+import kotlinx.coroutines.flow.first
 
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.platform.DiskFileSink
@@ -60,6 +62,7 @@ class Phase2Tests {
             sender.onClaimReceived(claim)
 
             val linkInfo = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 9999)
+            receiver.state.first { it is ReceiverState.AcceptPrompt }
             val decision = receiver.acceptTransfer(linkInfo)
             sender.onDecisionReceived(decision, linkInfo)
 
@@ -102,6 +105,7 @@ class Phase2Tests {
             val claim = receiver.claimOffer()
             sender.onClaimReceived(claim)
 
+            receiver.state.first { it is ReceiverState.AcceptPrompt }
             val deny = receiver.denyTransfer("Not trusted")
             sender.onDecisionReceived(deny, LinkInfoMessage(LinkType.LAN, "127.0.0.1", 1234))
 

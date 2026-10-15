@@ -1,9 +1,15 @@
-﻿package com.yodrop.core.transfer
+package com.yodrop.core.transfer
 
 import kotlinx.serialization.Serializable
+import com.yodrop.core.protocol.ProtocolBounds
 
 @Serializable
 class ChunkBitmap(val totalChunks: Int) {
+    init {
+        require(totalChunks in 0..ProtocolBounds.MAX_TOTAL_CHUNKS) {
+            "Bitmap chunk count exceeds limit"
+        }
+    }
     private val bits = LongArray((totalChunks + 63) / 64)
 
     fun markReceived(index: Int) {
@@ -68,16 +74,33 @@ class ChunkBitmap(val totalChunks: Int) {
 }
 
 object ChunkPlanner {
-    const val DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024 // 4 MiB
+    const val DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 
-    fun calculateTotalChunks(fileSize: Long, chunkSize: Int = DEFAULT_CHUNK_SIZE): Int {
-        if (fileSize <= 0) return 0
-        return ((fileSize + chunkSize - 1) / chunkSize).toInt()
+    fun calculateTotalChunks(
+        fileSize: Long,
+        chunkSize: Int = DEFAULT_CHUNK_SIZE
+    ): Int {
+        require(fileSize >= 0) { "Negative file size" }
+        require(chunkSize > 0) { "Invalid chunk size" }
+
+        val total = fileSize / chunkSize +
+            if (fileSize % chunkSize == 0L) 0 else 1
+        require(total <= ProtocolBounds.MAX_TOTAL_CHUNKS) {
+            "File chunk count exceeds limit"
+        }
+        return total.toInt()
     }
 
-    fun getChunkByteRange(chunkIndex: Int, fileSize: Long, chunkSize: Int = DEFAULT_CHUNK_SIZE): Pair<Long, Long> {
+    fun getChunkByteRange(
+        chunkIndex: Int,
+        fileSize: Long,
+        chunkSize: Int = DEFAULT_CHUNK_SIZE
+    ): Pair<Long, Long> {
+        val total = calculateTotalChunks(fileSize, chunkSize)
+        require(chunkIndex >= 0 && chunkIndex < total) {
+            "Chunk index outside file"
+        }
         val start = chunkIndex.toLong() * chunkSize
-        val end = kotlin.math.min(start + chunkSize, fileSize)
-        return Pair(start, end)
+        return start to minOf(start + chunkSize.toLong(), fileSize)
     }
 }

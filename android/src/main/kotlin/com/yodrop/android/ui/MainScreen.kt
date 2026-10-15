@@ -1,4 +1,4 @@
-﻿package com.yodrop.android.ui
+package com.yodrop.android.ui
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
@@ -49,6 +49,13 @@ fun MainScreen(
                 }
             }
 
+            receiverState is ReceiverState.Scanning -> {
+                Text("Waiting for an offer...")
+                Text(
+                    "BLE discovery wiring is pending.",
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
             senderState is SenderState.Advertising -> {
                 CircularProgressIndicator()
                 Text("Advertising... Waiting for receiver", modifier = Modifier.padding(top = 16.dp))

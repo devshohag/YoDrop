@@ -127,3 +127,15 @@ iOS Info.plist: `NSCameraUsageDescription`, `NSBluetoothAlwaysUsageDescription`,
 ## 11. Store notes
 - Do not use "AirDrop" or "Quick Share" in name/metadata.
 - Privacy policy: camera used only for on-device gesture detection; no data collected.
+
+
+## Approved A1 exception — 2026-10-15
+Owner approved bundled BouncyCastle for X25519 on JVM/Android, keeping
+Android minSdk 29. It is the sole additional crypto dependency permitted
+by this decision; other cryptographic operations remain platform-backed.
+The JVM/Android CryptoEngine actual lives in jvmAndAndroidMain.
+
+## Approved A3 clarification — 2026-10-15
+Receiver CLAIM window is 10 seconds from OFFER_SEEN.
+The human verification/accept prompt has a separate 60-second timeout on
+both sides. LINKING remains 20 seconds and socket read idle remains 15 seconds.

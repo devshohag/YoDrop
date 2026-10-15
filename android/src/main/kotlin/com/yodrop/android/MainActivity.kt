@@ -1,4 +1,4 @@
-﻿package com.yodrop.android
+package com.yodrop.android
 
 import android.content.ContentValues
 import android.os.Build
@@ -26,7 +26,25 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
 
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.UUID
 class MainActivity : ComponentActivity() {
+    private val pickSendFile = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            startUriSendFlow(uri)
+        }
+    }
+
 
     private lateinit var senderMachine: SenderStateMachine
     private lateinit var receiverMachine: ReceiverStateMachine
@@ -48,41 +66,152 @@ class MainActivity : ComponentActivity() {
             MainScreen(
                 senderState = senderState,
                 receiverState = receiverState,
-                onSendClick = { startSampleSendFlow() },
+                onSendClick = { pickSendFile.launch(arrayOf("*/*")) },
                 onReceiveClick = {
-                    receiverMachine.startScanning()
+                    lifecycleScope.launch { receiverMachine.startScanning() }
                 },
                 onAcceptClick = {
                     val fallbackLink = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 8888)
-                    receiverMachine.acceptTransfer(fallbackLink)
+                    lifecycleScope.launch {
+                        try {
+                            receiverMachine.acceptTransfer(fallbackLink)
+                        } catch (_: IllegalStateException) {
+                            // A stale/repeated UI action is rejected by the core.
+                        }
+                    }
                 },
-                onDenyClick = { receiverMachine.denyTransfer("User declined") },
+                onDenyClick = {
+                    lifecycleScope.launch {
+                        try {
+                            receiverMachine.denyTransfer("User declined")
+                        } catch (_: IllegalStateException) {
+                            // Prompt may already have been dismissed.
+                        }
+                    }
+                },
                 onCancelClick = {
-                    senderMachine.cancel("User cancelled")
-                    receiverMachine.cancel("User cancelled")
+                    lifecycleScope.launch {
+                        senderMachine.cancel("User cancelled")
+                        receiverMachine.cancel("User cancelled")
+                        senderMachine.reset()
+                        receiverMachine.reset()
+                    }
                 }
             )
         }
     }
 
-    private fun startSampleSendFlow() {
-        val sampleFile = File(cacheDir, "sample_send.txt")
-        if (!sampleFile.exists()) {
-            sampleFile.writeText("YoDrop verified test payload.")
-        }
-        val digest = MessageDigest.getInstance("SHA-256")
-        val sha256 = digest.digest(sampleFile.readBytes())
-        val meta = FileMeta(
-            id = "sample-1",
-            name = "sample_send.txt",
-            size = sampleFile.length(),
-            mime = "text/plain",
-            sha256 = sha256
-        )
-        val source: FileSource = DiskFileSource(meta.id, sampleFile)
-        senderMachine.onGrabbed(listOf(meta), mapOf(meta.id to source))
-    }
+    private fun startUriSendFlow(uri: Uri) {
+        lifecycleScope.launch {
+            var cachedFile: File? = null
+            var source: FileSource? = null
+            var handedOff = false
 
+            try {
+                val meta = withContext(Dispatchers.IO) {
+                    var displayName = "received_file"
+
+                    contentResolver.query(
+                        uri,
+                        arrayOf(OpenableColumns.DISPLAY_NAME),
+                        null,
+                        null,
+                        null
+                    )?.use { cursor ->
+                        val index = cursor.getColumnIndex(
+                            OpenableColumns.DISPLAY_NAME
+                        )
+                        if (index >= 0 && cursor.moveToFirst()) {
+                            val name = cursor.getString(index)
+                            if (!name.isNullOrBlank()) {
+                                displayName = name
+                            }
+                        }
+                    }
+
+                    // Keep a filename, never a provider-supplied path.
+                    displayName = displayName
+                        .substringAfterLast('/')
+                        .substringAfterLast('\\')
+                        .filter { it >= ' ' && it != '\u007f' }
+                        .trim()
+
+                    if (displayName.isBlank() ||
+                        displayName.startsWith(".")) {
+                        displayName = "received_file"
+                    }
+
+                    val localFile = File.createTempFile(
+                        "yodrop_send_",
+                        ".cache",
+                        cacheDir
+                    )
+                    cachedFile = localFile
+
+                    val digest = MessageDigest.getInstance("SHA-256")
+                    val input = contentResolver.openInputStream(uri)
+                        ?: throw IOException("Cannot open selected file")
+
+                    input.use { incoming ->
+                        FileOutputStream(localFile).use { outgoing ->
+                            val buffer = ByteArray(64 * 1024)
+
+                            while (true) {
+                                ensureActive()
+                                val count = incoming.read(buffer)
+                                if (count == -1) break
+
+                                outgoing.write(buffer, 0, count)
+                                digest.update(buffer, 0, count)
+                            }
+                            outgoing.flush()
+                        }
+                    }
+
+                    FileMeta(
+                        id = UUID.randomUUID().toString(),
+                        name = displayName,
+                        size = localFile.length(),
+                        mime = contentResolver.getType(uri)
+                            ?: "application/octet-stream",
+                        sha256 = digest.digest()
+                    )
+                }
+
+                val localFile = cachedFile
+                    ?: throw IOException("Cached file is unavailable")
+                val diskSource: FileSource = DiskFileSource(
+                    meta.id,
+                    localFile
+                )
+                source = diskSource
+
+                handedOff = senderMachine.onGrabbed(
+                    listOf(meta),
+                    mapOf(meta.id to diskSource)
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Toast.makeText(
+                    this@MainActivity,
+                    "Cannot prepare file: ${e.message}",
+                    Toast.LENGTH_LONG
+                ).show()
+            } finally {
+                // Successful handoff keeps the source valid for the sender.
+                if (!handedOff) {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                        try {
+                            source?.close()
+                        } finally {
+                            cachedFile?.delete()
+                        }
+                    }
+                }
+            }
+        }
+    }
     private fun createScopedStorageFileSink(meta: FileMeta): FileSink {
         val tempFile = File(cacheDir, "yodrop_recv_${meta.id}.part")
         val baseSink = DiskFileSink(meta.id, tempFile)
@@ -101,7 +230,7 @@ class MainActivity : ComponentActivity() {
             override suspend fun commit() {
                 baseSink.commit()
                 // Strict publish: will throw on error and will NEVER delete tempFile on failure
-                publishToMediaStore(tempFile, meta.name, meta.mime)
+                publishToMediaStore(baseSink.committedFile, meta.name, meta.mime)
             }
 
             override suspend fun close() {

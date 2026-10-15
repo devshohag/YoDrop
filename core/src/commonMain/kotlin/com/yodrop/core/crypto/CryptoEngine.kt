@@ -1,4 +1,4 @@
-﻿package com.yodrop.core.crypto
+package com.yodrop.core.crypto
 
 data class KeyPair(val publicKey: ByteArray, val privateKey: ByteArray)
 
@@ -10,6 +10,7 @@ data class SessionKeys(
 )
 
 expect object CryptoEngine {
+    fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean
     fun randomBytes(length: Int): ByteArray
     fun generateX25519KeyPair(): KeyPair
     fun computeSharedSecret(myPrivateKey: ByteArray, peerPublicKey: ByteArray): ByteArray

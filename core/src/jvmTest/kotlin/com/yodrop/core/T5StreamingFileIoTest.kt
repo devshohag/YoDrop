@@ -1,4 +1,6 @@
-﻿package com.yodrop.core
+package com.yodrop.core
+
+import kotlinx.coroutines.flow.first
 
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.platform.DiskFileSink
@@ -77,6 +79,7 @@ class T5StreamingFileIoTest {
             sender.onClaimReceived(claim)
 
             val linkInfo = LinkInfoMessage(LinkType.LAN, "127.0.0.1", port)
+            receiver.state.first { it is ReceiverState.AcceptPrompt }
             val decision = receiver.acceptTransfer(linkInfo)
             sender.onDecisionReceived(decision, linkInfo)
 

@@ -1,136 +1,75 @@
-﻿package com.yodrop.core
+package com.yodrop.core
 
 import com.yodrop.core.crypto.CryptoEngine
-import com.yodrop.core.crypto.SessionKeys
 import com.yodrop.core.protocol.*
-import com.yodrop.core.session.ReceiverState
-import com.yodrop.core.session.ReceiverStateMachine
-import com.yodrop.core.session.SenderState
-import com.yodrop.core.session.SenderStateMachine
+import com.yodrop.core.session.*
 import com.yodrop.core.transport.Connection
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
+import com.yodrop.core.transport.LoopbackConnection
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertTrue
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class T2AuthVerificationTest {
+    private fun exercise(mode: String) = runTest {
+        val sender = SenderStateMachine(backgroundScope)
+        val receiver = ReceiverStateMachine(backgroundScope)
+        val meta = FileMeta(
+            "file", "file.txt", 1, "text/plain", ByteArray(32)
+        )
+        sender.onGrabbed(listOf(meta), emptyMap())
+        val offer = (sender.state.value as SenderState.Advertising).offer
 
-    private class MemoryPipeConnection(
-        private val incoming: Channel<RawFrame>,
-        private val outgoing: Channel<RawFrame>
-    ) : Connection {
-        private var closed = false
-        override val isClosed: Boolean get() = closed
+        receiver.startScanning()
+        receiver.onOfferDiscovered(offer)
+        val claim = receiver.claimOffer()
+        sender.onClaimReceived(claim)
+        receiver.state.first { it is ReceiverState.AcceptPrompt }
+        val link = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 1234)
+        sender.onDecisionReceived(receiver.acceptTransfer(link), link)
 
-        override suspend fun readFrame(): RawFrame {
-            if (closed) error("Connection closed")
-            return incoming.receive()
-        }
-
-        override suspend fun writeFrame(frame: RawFrame) {
-            if (closed) error("Connection closed")
-            outgoing.send(frame)
-        }
-
-        override suspend fun close() {
-            closed = true
-            incoming.close()
-            outgoing.close()
-        }
-    }
-
-    private fun createPipes(): Pair<Connection, Connection> {
-        val aToB = Channel<RawFrame>(Channel.UNLIMITED)
-        val bToA = Channel<RawFrame>(Channel.UNLIMITED)
-        return Pair(MemoryPipeConnection(bToA, aToB), MemoryPipeConnection(aToB, bToA))
-    }
-
-    @Test
-    fun testWrongSessionIdEndsInFailed() = runBlocking {
-        val scope = CoroutineScope(Dispatchers.Default)
-        val receiver = ReceiverStateMachine(scope)
-        val dummyKeys = SessionKeys(ByteArray(32), ByteArray(32), ByteArray(12), "1234")
-        val correctSid = ByteArray(16) { 1 }
-        val dummyOffer = OfferMessage(correctSid, ByteArray(32), 1, 100L, "test")
-
-        receiver.sessionKeys = dummyKeys
-        receiver.activeOffer = dummyOffer
-
-        val (connRx, connAttacker) = createPipes()
-        receiver.attachConnection(connRx)
-
-        // Attacker sends AUTH with WRONG sessionId
-        val wrongSid = ByteArray(16) { 9 }
-        val authMsg = AuthMessage(sessionId = wrongSid, authTag = ByteArray(32))
-        connAttacker.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, authMsg))
-
-        withTimeout(3000) {
-            while (receiver.state.value !is ReceiverState.Failed) {
-                delay(10)
+        val (senderWire, receiverWire) = LoopbackConnection.createPair()
+        val tampered = object : Connection by senderWire {
+            override suspend fun writeFrame(frame: RawFrame) {
+                if (frame.type != FrameType.AUTH) {
+                    senderWire.writeFrame(frame)
+                    return
+                }
+                val auth = ProtocolCodec.decodePayload<AuthMessage>(frame)
+                val changed = when (mode) {
+                    "session" -> auth.copy(
+                        sessionId = auth.sessionId.copyOf().also {
+                            it[0] = (it[0].toInt() xor 1).toByte()
+                        }
+                    )
+                    "tag" -> auth.copy(
+                        authTag = auth.authTag.copyOf().also {
+                            it[0] = (it[0].toInt() xor 1).toByte()
+                        }
+                    )
+                    else -> auth.copy(
+                        authTag = CryptoEngine.computeHmacSha256(
+                            ByteArray(32),
+                            "authreceiver".encodeToByteArray() + offer.sessionId
+                        )
+                    )
+                }
+                senderWire.writeFrame(
+                    ProtocolCodec.encodeToFrame(FrameType.AUTH, changed)
+                )
             }
         }
-        assertTrue(receiver.state.value is ReceiverState.Failed, "Wrong sessionId must lead to Failed state")
+
+        sender.attachConnection(tampered)
+        receiver.attachConnection(receiverWire)
+        runCurrent()
+        assertTrue(receiver.state.value is ReceiverState.Failed)
     }
 
-    @Test
-    fun testWrongAuthTagEndsInFailed() = runBlocking {
-        val scope = CoroutineScope(Dispatchers.Default)
-        val receiver = ReceiverStateMachine(scope)
-        val dummyKeys = SessionKeys(ByteArray(32), ByteArray(32), ByteArray(12), "1234")
-        val correctSid = ByteArray(16) { 1 }
-        val dummyOffer = OfferMessage(correctSid, ByteArray(32), 1, 100L, "test")
-
-        receiver.sessionKeys = dummyKeys
-        receiver.activeOffer = dummyOffer
-
-        val (connRx, connAttacker) = createPipes()
-        receiver.attachConnection(connRx)
-
-        // Attacker sends correct sid but wrong authTag
-        val wrongTag = ByteArray(32) { 0xFF.toByte() }
-        val authMsg = AuthMessage(sessionId = correctSid, authTag = wrongTag)
-        connAttacker.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, authMsg))
-
-        withTimeout(3000) {
-            while (receiver.state.value !is ReceiverState.Failed) {
-                delay(10)
-            }
-        }
-        assertTrue(receiver.state.value is ReceiverState.Failed, "Wrong auth tag must lead to Failed state")
-    }
-
-    @Test
-    fun testWrongRoleLabelEndsInFailed() = runBlocking {
-        val scope = CoroutineScope(Dispatchers.Default)
-        val receiver = ReceiverStateMachine(scope)
-        val s2r = ByteArray(32) { 2 }
-        val r2s = ByteArray(32) { 3 }
-        val dummyKeys = SessionKeys(s2r, r2s, ByteArray(12), "1234")
-        val sid = ByteArray(16) { 1 }
-        val dummyOffer = OfferMessage(sid, ByteArray(32), 1, 100L, "test")
-
-        receiver.sessionKeys = dummyKeys
-        receiver.activeOffer = dummyOffer
-
-        val (connRx, connAttacker) = createPipes()
-        receiver.attachConnection(connRx)
-
-        // Attacker computes tag using WRONG role label ("authreceiver" instead of "authsender")
-        val wrongRolePayload = "authreceiver".encodeToByteArray() + sid
-        val tagWithWrongRole = CryptoEngine.computeHmacSha256(s2r, wrongRolePayload)
-        val authMsg = AuthMessage(sessionId = sid, authTag = tagWithWrongRole)
-        connAttacker.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, authMsg))
-
-        withTimeout(3000) {
-            while (receiver.state.value !is ReceiverState.Failed) {
-                delay(10)
-            }
-        }
-        assertTrue(receiver.state.value is ReceiverState.Failed, "Wrong role label must lead to Failed state")
-    }
+    @Test fun testWrongSessionIdEndsInFailed() = exercise("session")
+    @Test fun testWrongAuthTagEndsInFailed() = exercise("tag")
+    @Test fun testWrongRoleLabelEndsInFailed() = exercise("role")
 }

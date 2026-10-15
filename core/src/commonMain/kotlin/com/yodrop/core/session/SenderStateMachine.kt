@@ -1,4 +1,4 @@
-﻿package com.yodrop.core.session
+package com.yodrop.core.session
 
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.crypto.KeyPair
@@ -12,113 +12,213 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.security.MessageDigest
-import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class SenderStateMachine(
     private val scope: CoroutineScope,
-    private val onCleanup: (() -> Unit)? = null
+    private val onCleanup: (() -> Unit)? = null,
+    private val timeouts: Timeouts = Timeouts()
 ) {
     private val _state = MutableStateFlow<SenderState>(SenderState.Idle)
     val state: StateFlow<SenderState> = _state.asStateFlow()
 
+    private val eventMutex = Mutex()
+    private val _transitions = MutableSharedFlow<SenderState>(
+        replay = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val transitions = _transitions.asSharedFlow()
+
+    init {
+        _transitions.tryEmit(SenderState.Idle)
+    }
+
     private var myKeyPair: KeyPair? = null
-    var sessionKeys: SessionKeys? = null
-    var sessionId: ByteArray? = null
+    private var sessionKeys: SessionKeys? = null
+    private var sessionId: ByteArray? = null
     private var filesToSend: List<FileMeta> = emptyList()
     private var fileSourceMap: Map<String, FileSource> = emptyMap()
     private val activeConnections = mutableListOf<Connection>()
-    private val attemptCounter = AtomicInteger(0)
+    private val connectionsMutex = Mutex()
+    private val attemptMutex = Mutex()
+    private var attemptCounter = 0
+    private val workers = mutableListOf<Job>()
+    private var cleanupJob: Job? = null
 
     private var offerTimeoutJob: Job? = null
-    private var claimTimeoutJob: Job? = null
+    private var acceptTimeoutJob: Job? = null
     private var linkingTimeoutJob: Job? = null
 
-    fun onGrabbed(files: List<FileMeta>, sources: Map<String, FileSource>) {
-        filesToSend = files
-        fileSourceMap = sources
-        attemptCounter.set(0)
+    private fun publishLocked(next: SenderState) {
+        _state.value = next
+        _transitions.tryEmit(next)
+    }
+
+    private fun failLocked(reason: String) {
+        if (_state.value is SenderState.Idle ||
+            SessionPolicy.senderTerminal(_state.value)) return
+        publishLocked(SenderState.Failed(reason))
+        cleanup()
+    }
+
+    private suspend fun setState(next: SenderState): Boolean =
+        eventMutex.withLock {
+            val current = _state.value
+            val allowed = when (next) {
+                is SenderState.Transferring ->
+                    current is SenderState.Auth ||
+                    current is SenderState.Transferring
+                SenderState.Done -> current is SenderState.Transferring
+                else -> false
+            }
+            if (!allowed) return@withLock false
+            publishLocked(next)
+            true
+        }
+
+    suspend fun onGrabbed(
+        files: List<FileMeta>,
+        sources: Map<String, FileSource>
+    ): Boolean = eventMutex.withLock {
+        if (!scope.isActive ||
+            !SessionPolicy.sender(_state.value, SessionEvent.GRAB)) {
+            return@withLock false
+        }
+
+        ManifestMessage(files).validate()
+        publishLocked(SenderState.Grabbed)
+        filesToSend = files.map { it.copy(sha256 = it.sha256.copyOf()) }
+        fileSourceMap = sources.toMap()
 
         val keyPair = CryptoEngine.generateX25519KeyPair()
         myKeyPair = keyPair
-        
         val sid = CryptoEngine.randomBytes(16)
         sessionId = sid
 
-        val totalBytes = files.sumOf { it.size }
         val offer = OfferMessage(
-            sessionId = sid,
-            senderPubKey = keyPair.publicKey,
-            fileCount = files.size,
-            totalBytes = totalBytes,
-            previewName = files.firstOrNull()?.name ?: "Unknown"
+            sid.copyOf(),
+            keyPair.publicKey.copyOf(),
+            files.size,
+            files.sumOf { it.size },
+            files.first().name
         )
-        _state.value = SenderState.Advertising(offer)
+        publishLocked(SenderState.Advertising(offer))
 
-        offerTimeoutJob?.cancel()
         offerTimeoutJob = scope.launch {
-            delay(SessionTimeouts.OFFER_TIMEOUT_MS)
-            if (_state.value is SenderState.Advertising) {
-                fail("Offer expired after ${SessionTimeouts.OFFER_TIMEOUT_MS}ms")
-            }
-        }
-    }
-
-    fun onClaimReceived(claim: ClaimMessage) {
-        offerTimeoutJob?.cancel()
-        val keyPair = myKeyPair ?: return
-        val sid = sessionId ?: return
-        val sharedSecret = CryptoEngine.computeSharedSecret(keyPair.privateKey, claim.receiverPubKey)
-        val keys = CryptoEngine.deriveSessionKeys(sharedSecret, sid)
-        sessionKeys = keys
-
-        _state.value = SenderState.AwaitAccept(keys.verifyCode)
-
-        claimTimeoutJob?.cancel()
-        claimTimeoutJob = scope.launch {
-            delay(SessionTimeouts.CLAIM_TIMEOUT_MS)
-            if (_state.value is SenderState.AwaitAccept) {
-                fail("Claim decision timed out after ${SessionTimeouts.CLAIM_TIMEOUT_MS}ms")
-            }
-        }
-    }
-
-    fun onDecisionReceived(decision: DecisionMessage, linkInfo: LinkInfoMessage) {
-        claimTimeoutJob?.cancel()
-        if (!decision.accepted) {
-            fail("Receiver denied transfer: ${decision.reason}")
-            return
-        }
-        _state.value = SenderState.Linking(linkInfo)
-
-        linkingTimeoutJob?.cancel()
-        linkingTimeoutJob = scope.launch {
-            delay(SessionTimeouts.LINKING_TIMEOUT_MS)
-            if (_state.value is SenderState.Linking) {
-                fail("Transport linking timed out after ${SessionTimeouts.LINKING_TIMEOUT_MS}ms")
-            }
-        }
-    }
-
-    fun attachConnection(connection: Connection) {
-        linkingTimeoutJob?.cancel()
-        synchronized(activeConnections) {
-            activeConnections.add(connection)
-        }
-        _state.value = SenderState.Auth
-        scope.launch {
-            try {
-                runTransferWorker(connection)
-            } catch (e: CancellationException) {
-                cancel("Cancelled by sender")
-            } catch (e: Throwable) {
-                if (!connection.isClosed && _state.value !is SenderState.Done) {
-                    fail("Transfer worker failed: ${e.message}")
+            delay(timeouts.offerMs)
+            eventMutex.withLock {
+                if (_state.value is SenderState.Advertising) {
+                    failLocked("Offer expired")
                 }
             }
         }
+        true
     }
 
+    suspend fun onClaimReceived(claim: ClaimMessage): Boolean =
+        eventMutex.withLock {
+            if (!scope.isActive ||
+                !SessionPolicy.sender(_state.value, SessionEvent.CLAIM)) {
+                return@withLock false
+            }
+            val sid = sessionId ?: return@withLock false
+            if (!CryptoEngine.constantTimeEquals(sid, claim.sessionId) ||
+                claim.receiverPubKey.size != 32) return@withLock false
+
+            // Single-send: the serialized first valid CLAIM wins.
+            // Group claim-window behavior belongs to P10.
+            val keyPair = myKeyPair ?: return@withLock false
+            val sharedSecret = try {
+                CryptoEngine.computeSharedSecret(
+                    keyPair.privateKey, claim.receiverPubKey
+                )
+            } catch (_: IllegalArgumentException) {
+                return@withLock false
+            }
+
+            offerTimeoutJob?.cancel()
+            publishLocked(SenderState.Claimed)
+            val keys = CryptoEngine.deriveSessionKeys(sharedSecret, sid)
+            sessionKeys = keys
+            publishLocked(SenderState.AwaitAccept(keys.verifyCode))
+
+            acceptTimeoutJob = scope.launch {
+                delay(timeouts.acceptPromptMs)
+                eventMutex.withLock {
+                    if (_state.value is SenderState.AwaitAccept) {
+                        failLocked("Accept prompt timed out")
+                    }
+                }
+            }
+            true
+        }
+
+    suspend fun onDecisionReceived(
+        decision: DecisionMessage,
+        linkInfo: LinkInfoMessage
+    ): Boolean = eventMutex.withLock {
+        if (!scope.isActive ||
+            !SessionPolicy.sender(_state.value, SessionEvent.DECISION)) {
+            return@withLock false
+        }
+        val sid = sessionId ?: return@withLock false
+        if (!CryptoEngine.constantTimeEquals(sid, decision.sessionId)) {
+            return@withLock false
+        }
+        acceptTimeoutJob?.cancel()
+
+        if (!decision.accepted) {
+            failLocked("Receiver denied transfer: ${decision.reason}")
+            return@withLock true
+        }
+
+        publishLocked(SenderState.Linking(linkInfo))
+        linkingTimeoutJob = scope.launch {
+            delay(timeouts.linkingMs)
+            eventMutex.withLock {
+                if (_state.value is SenderState.Linking) {
+                    failLocked("Transport linking timed out")
+                }
+            }
+        }
+        true
+    }
+
+    suspend fun attachConnection(connection: Connection): Boolean =
+        eventMutex.withLock {
+            if (!scope.isActive ||
+                !SessionPolicy.sender(_state.value, SessionEvent.ATTACH)) {
+                withContext(NonCancellable) {
+                    runCatching { connection.close() }
+                }
+                return@withLock false
+            }
+
+            linkingTimeoutJob?.cancel()
+            connectionsMutex.withLock {
+                activeConnections.add(connection)
+            }
+            if (_state.value is SenderState.Linking) {
+                publishLocked(SenderState.Auth)
+            }
+
+            val job = scope.launch {
+                try {
+                    runTransferWorker(connection)
+                } catch (e: CancellationException) {
+                    cancel("Cancelled by sender")
+                    throw e
+                } catch (e: Throwable) {
+                    fail("Transfer worker failed: ${e.message}")
+                }
+            }
+            workers.add(job)
+            true
+        }
     private suspend fun runTransferWorker(connection: Connection) {
         val keys = sessionKeys ?: throw IllegalStateException("No session keys derived")
         val sid = sessionId ?: throw IllegalStateException("No sessionId initialized")
@@ -128,7 +228,9 @@ class SenderStateMachine(
         val myAuthMsg = AuthMessage(sessionId = sid, authTag = myAuthTag)
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, myAuthMsg))
 
-        val peerAuthFrame = connection.readFrame()
+        val peerAuthFrame = readFrameWithIdleTimeout(
+            connection, timeouts.socketIdleMs
+        )
         if (peerAuthFrame.type != FrameType.AUTH) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Expected AUTH frame")))
             fail("Expected AUTH frame, got ${peerAuthFrame.type}")
@@ -136,7 +238,7 @@ class SenderStateMachine(
         }
 
         val peerAuthMsg = ProtocolCodec.decodePayload<AuthMessage>(peerAuthFrame)
-        if (!MessageDigest.isEqual(peerAuthMsg.sessionId, sid)) {
+        if (!CryptoEngine.constantTimeEquals(peerAuthMsg.sessionId, sid)) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("SessionId mismatch")))
             fail("SessionId mismatch in AUTH")
             return
@@ -144,7 +246,7 @@ class SenderStateMachine(
 
         val expectedReceiverAuthPayload = "authreceiver".encodeToByteArray() + sid
         val expectedReceiverTag = CryptoEngine.computeHmacSha256(keys.receiverToSenderKey, expectedReceiverAuthPayload)
-        if (!MessageDigest.isEqual(peerAuthMsg.authTag, expectedReceiverTag)) {
+        if (!CryptoEngine.constantTimeEquals(peerAuthMsg.authTag, expectedReceiverTag)) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("AUTH tag verification failed")))
             fail("AUTH tag verification failed")
             return
@@ -154,16 +256,15 @@ class SenderStateMachine(
         manifest.validate()
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.MANIFEST, manifest))
 
+        if (!setState(SenderState.Transferring(
+                0f, filesToSend.firstOrNull()?.name ?: ""
+            ))) return
+
         var completedFiles = 0
         while (!connection.isClosed && _state.value !is SenderState.Done && _state.value !is SenderState.Failed) {
-            val frame = try {
-                withTimeout(SessionTimeouts.SOCKET_IDLE_TIMEOUT_MS) {
-                    connection.readFrame()
-                }
-            } catch (e: Exception) {
-                // Peer closed stream normally or timeout
-                break
-            }
+            val frame = readFrameWithIdleTimeout(
+                connection, timeouts.socketIdleMs
+            )
 
             when (frame.type) {
                 FrameType.CHUNK_REQ -> {
@@ -176,18 +277,24 @@ class SenderStateMachine(
                 }
                 FrameType.ACK -> {}
                 FrameType.PING -> {
-                    connection.writeFrame(RawFrame(FrameType.PONG, ByteArray(0)))
+                    val ping = ProtocolCodec.decodePayload<PingPongMessage>(frame)
+                    if (!ping.reply) {
+                        connection.writeFrame(
+                            ProtocolCodec.encodeToFrame(
+                                FrameType.PING, ping.copy(reply = true)
+                            )
+                        )
+                    }
                 }
-                FrameType.PONG -> {}
                 FrameType.FILE_DONE -> {
                     val doneMsg = ProtocolCodec.decodePayload<FileDoneMessage>(frame)
                     if (doneMsg.ok) {
                         completedFiles++
                         val progress = completedFiles.toFloat() / filesToSend.size.toFloat()
-                        _state.value = SenderState.Transferring(progress, doneMsg.fileId)
+                        if (!setState(SenderState.Transferring(progress, doneMsg.fileId))) return
                         if (completedFiles >= filesToSend.size) {
                             connection.writeFrame(RawFrame(FrameType.DONE, ByteArray(0)))
-                            _state.value = SenderState.Done
+                            if (!setState(SenderState.Done)) return
                             cleanup()
                             return
                         }
@@ -197,7 +304,7 @@ class SenderStateMachine(
                     }
                 }
                 FrameType.DONE -> {
-                    _state.value = SenderState.Done
+                    if (!setState(SenderState.Done)) return
                     cleanup()
                     return
                 }
@@ -218,15 +325,28 @@ class SenderStateMachine(
         keys: SessionKeys,
         sid: ByteArray
     ) {
-        val source = fileSourceMap[fileId] ?: throw IllegalStateException("File source not found: $fileId")
-        val fileSize = source.size
+        val meta = filesToSend.firstOrNull { it.id == fileId }
+            ?: throw IllegalArgumentException("Unknown requested file id")
+        ProtocolBounds.validateRequest(chunkIndices, meta.size, chunkSize)
+
+        val source = fileSourceMap[fileId]
+            ?: throw IllegalStateException("File source not found: $fileId")
+        require(source.size == meta.size) { "Source size changed" }
+        val fileSize = meta.size
 
         for (chunkIdx in chunkIndices) {
             val (start, end) = ChunkPlanner.getChunkByteRange(chunkIdx, fileSize, chunkSize)
             val length = (end - start).toInt()
             val slice = source.readChunk(start, length)
+            require(slice.size == length) { "Source returned a short chunk" }
 
-            val currentAttempt = attemptCounter.incrementAndGet()
+            val currentAttempt = attemptMutex.withLock {
+                check(attemptCounter < Int.MAX_VALUE) {
+                    "Attempt counter exhausted"
+                }
+                attemptCounter += 1
+                attemptCounter
+            }
             val nonce = NonceUtils.buildChunkNonce(keys.nonceBase, chunkIdx, currentAttempt)
             val aad = NonceUtils.buildAad(sid, fileId, chunkIdx)
             val ciphertext = CryptoEngine.encryptAesGcm(keys.senderToReceiverKey, nonce, slice, aad)
@@ -252,30 +372,61 @@ class SenderStateMachine(
         }
     }
 
-    fun fail(reason: String) {
-        _state.value = SenderState.Failed(reason)
-        cleanup()
-    }
-
-    fun cancel(reason: String = "User cancelled") {
-        _state.value = SenderState.Cancelled(reason)
-        cleanup()
-    }
-
-    fun cleanup() {
-        offerTimeoutJob?.cancel()
-        claimTimeoutJob?.cancel()
-        linkingTimeoutJob?.cancel()
-
-        val connsToClose = synchronized(activeConnections) {
-            val list = activeConnections.toList()
-            activeConnections.clear()
-            list
+    private suspend fun fail(reason: String) {
+        eventMutex.withLock {
+            failLocked(reason)
         }
+    }
+
+    suspend fun cancel(reason: String = "User cancelled"): Boolean =
+        eventMutex.withLock {
+            if (!SessionPolicy.sender(_state.value, SessionEvent.CANCEL)) {
+                return@withLock false
+            }
+            publishLocked(SenderState.Cancelled(reason))
+            cleanup()
+            true
+        }
+
+    suspend fun reset(): Boolean {
+        val pending = eventMutex.withLock {
+            if (!SessionPolicy.sender(_state.value, SessionEvent.RESET)) {
+                return false
+            }
+            workers.toList() to cleanupJob
+        }
+        pending.first.forEach { it.cancelAndJoin() }
+        pending.second?.join()
+
+        return eventMutex.withLock {
+            if (!SessionPolicy.sender(_state.value, SessionEvent.RESET)) {
+                return@withLock false
+            }
+            workers.clear()
+            myKeyPair = null
+            sessionKeys = null
+            sessionId = null
+            filesToSend = emptyList()
+            fileSourceMap = emptyMap()
+            cleanupJob = null
+            publishLocked(SenderState.Idle)
+            true
+        }
+    }
+
+    private fun cleanup() {
+        offerTimeoutJob?.cancel()
+        acceptTimeoutJob?.cancel()
+        linkingTimeoutJob?.cancel()
         val sourcesToClose = fileSourceMap.values.toList()
 
-        scope.launch {
-            connsToClose.forEach { runCatching { it.close() } }
+        cleanupJob = scope.launch(NonCancellable) {
+            val connections = connectionsMutex.withLock {
+                val snapshot = activeConnections.toList()
+                activeConnections.clear()
+                snapshot
+            }
+            connections.forEach { runCatching { it.close() } }
             sourcesToClose.forEach { runCatching { it.close() } }
         }
         onCleanup?.invoke()

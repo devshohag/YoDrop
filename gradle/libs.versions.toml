@@ -1,4 +1,5 @@
 [versions]
+bouncycastle = "1.86"
 kotlin = "2.2.0"
 agp = "8.10.1"
 coroutines = "1.8.0"
@@ -8,6 +9,7 @@ activity-compose = "1.9.3"
 lifecycle = "2.8.6"
 
 [libraries]
+bouncycastle-provider = { module = "org.bouncycastle:bcprov-jdk15to18", version.ref = "bouncycastle" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
 kotlinx-serialization-cbor = { module = "org.jetbrains.kotlinx:kotlinx-serialization-cbor", version.ref = "serialization" }

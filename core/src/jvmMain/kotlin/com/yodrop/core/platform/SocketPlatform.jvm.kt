@@ -1,4 +1,4 @@
-﻿package com.yodrop.core.platform
+package com.yodrop.core.platform
 
 import com.yodrop.core.protocol.RawFrame
 import kotlinx.coroutines.Dispatchers
@@ -68,10 +68,9 @@ actual class PlatformSocket(private val socket: Socket) {
 
     actual suspend fun close() {
         withContext(Dispatchers.IO) {
-            runCatching {
-                outputStream.flush()
-                socket.close()
-            }
+            // writeFrame already flushes. Close first to unblock peer/read IO.
+            runCatching { socket.close() }
+            Unit
         }
     }
 

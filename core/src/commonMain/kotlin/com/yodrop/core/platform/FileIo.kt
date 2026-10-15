@@ -1,6 +1,8 @@
-﻿package com.yodrop.core.platform
+package com.yodrop.core.platform
 
 import com.yodrop.core.crypto.CryptoEngine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 interface FileSource {
     val fileId: String
@@ -24,9 +26,11 @@ class MemoryFileSource(
     override val size: Long get() = data.size.toLong()
 
     override suspend fun readChunk(offset: Long, length: Int): ByteArray {
+        require(offset >= 0 && offset <= size) { "Invalid offset" }
+        require(length >= 0) { "Invalid length" }
         val start = offset.toInt()
-        val end = minOf(data.size, start + length)
-        return data.copyOfRange(start, end)
+        val count = minOf(length, data.size - start)
+        return data.copyOfRange(start, start + count)
     }
 
     override suspend fun close() {}
@@ -34,24 +38,52 @@ class MemoryFileSource(
 
 class MemoryFileSink(
     override val fileId: String,
-    private val expectedSize: Int = 0
+    expectedSize: Int = 0
 ) : FileSink {
-    private val buffer = java.io.ByteArrayOutputStream(expectedSize)
+    private val mutex = Mutex()
+    private var buffer = ByteArray(expectedSize.also {
+        require(it >= 0) { "Invalid expected size" }
+    })
+    private var writtenSize = 0
 
     override suspend fun writeChunk(offset: Long, data: ByteArray) {
-        synchronized(buffer) {
-            buffer.write(data)
+        require(offset >= 0 && offset <= Int.MAX_VALUE.toLong()) {
+            "Invalid offset"
+        }
+        val endLong = offset + data.size.toLong()
+        require(endLong <= Int.MAX_VALUE.toLong()) {
+            "Memory sink size exceeds Int range"
+        }
+
+        mutex.withLock {
+            val start = offset.toInt()
+            val end = endLong.toInt()
+
+            if (end > buffer.size) {
+                val doubled = minOf(
+                    Int.MAX_VALUE.toLong(),
+                    maxOf(1L, buffer.size.toLong()) * 2
+                ).toInt()
+                buffer = buffer.copyOf(maxOf(end, doubled))
+            }
+
+            data.copyInto(buffer, start)
+            writtenSize = maxOf(writtenSize, end)
         }
     }
 
     override suspend fun verifySha256(expectedSha256: ByteArray): Boolean {
-        val bytes = buffer.toByteArray()
-        val hash = CryptoEngine.sha256(bytes)
-        return hash.contentEquals(expectedSha256)
+        val snapshot = toByteArray()
+        return CryptoEngine.constantTimeEquals(
+            CryptoEngine.sha256(snapshot),
+            expectedSha256
+        )
     }
 
     override suspend fun commit() {}
     override suspend fun close() {}
 
-    fun toByteArray(): ByteArray = buffer.toByteArray()
+    suspend fun toByteArray(): ByteArray = mutex.withLock {
+        buffer.copyOf(writtenSize)
+    }
 }

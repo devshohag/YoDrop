@@ -1,4 +1,4 @@
-﻿package com.yodrop.core.platform
+package com.yodrop.core.platform
 
 import com.yodrop.core.crypto.CryptoEngine
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +38,10 @@ class DiskFileSink(
     override val fileId: String,
     private val targetFile: File
 ) : FileSink {
+    private var committedTarget: File? = null
+    val committedFile: File
+        get() = checkNotNull(committedTarget) { "File has not been committed" }
+
     private val partFile = File(targetFile.parentFile ?: File("."), "${targetFile.name}.part")
     private val raf: RandomAccessFile by lazy {
         partFile.parentFile?.mkdirs()
@@ -67,13 +71,35 @@ class DiskFileSink(
 
     override suspend fun commit(): Unit = withContext(Dispatchers.IO) {
         synchronized(raf) {
-            runCatching { raf.close() }
+            if (committedTarget != null) return@synchronized
+            raf.close()
+
+            val parent = targetFile.parentFile ?: File(".")
+            val dot = targetFile.name.lastIndexOf('.')
+            val stem = if (dot > 0) targetFile.name.substring(0, dot)
+                else targetFile.name
+            val extension = if (dot > 0) targetFile.name.substring(dot)
+                else ""
+
+            var suffix = 0
+            while (true) {
+                val candidate = if (suffix == 0) targetFile else File(
+                    parent, "$stem ($suffix)$extension"
+                )
+                try {
+                    // No REPLACE_EXISTING: an existing destination is retained.
+                    java.nio.file.Files.move(
+                        partFile.toPath(), candidate.toPath()
+                    )
+                    committedTarget = candidate
+                    break
+                } catch (_: java.nio.file.FileAlreadyExistsException) {
+                    check(suffix < Int.MAX_VALUE) { "No available filename" }
+                    suffix++
+                }
+            }
         }
-        if (targetFile.exists()) targetFile.delete()
-        val success = partFile.renameTo(targetFile)
-        if (!success) {
-            throw IllegalStateException("Failed to commit file from ${partFile.name} to${targetFile.name}")
-        }
+        Unit
     }
 
     override suspend fun close() = withContext(Dispatchers.IO) {

@@ -1,4 +1,6 @@
-﻿package com.yodrop.core
+package com.yodrop.core
+
+import kotlinx.coroutines.flow.first
 
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.platform.DiskFileSink
@@ -33,7 +35,7 @@ class Phase4SocketTests {
     }
 
     @Test
-    fun testRealTcpSocketTransferAndIntegrity() {
+    fun testRealTcpSocketTransferAndIntegrity() = runBlocking<Unit>(Dispatchers.IO) {
         val tempDir = File(System.getProperty("java.io.tmpdir"), "yodrop-test-p4-${System.currentTimeMillis()}")
         tempDir.mkdirs()
 
@@ -64,6 +66,7 @@ class Phase4SocketTests {
         sender.onClaimReceived(claim)
 
         val linkInfo = LinkInfoMessage(LinkType.WIFI_DIRECT, "127.0.0.1", port)
+        receiver.state.first { it is ReceiverState.AcceptPrompt }
         val decision = receiver.acceptTransfer(linkInfo)
         sender.onDecisionReceived(decision, linkInfo)
 

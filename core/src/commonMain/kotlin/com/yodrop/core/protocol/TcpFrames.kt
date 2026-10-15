@@ -1,4 +1,4 @@
-﻿package com.yodrop.core.protocol
+package com.yodrop.core.protocol
 
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
@@ -9,13 +9,13 @@ object FrameType {
     const val MANIFEST: Byte = 0x02
     const val CHUNK_REQ: Byte = 0x03
     const val CHUNK_DATA: Byte = 0x04
-    const val FILE_DONE: Byte = 0x05
-    const val DONE: Byte = 0x06
-    const val CANCEL: Byte = 0x07
-    const val PING: Byte = 0x08
-    const val PONG: Byte = 0x09
-    const val ACK: Byte = 0x0A
-    const val NACK: Byte = 0x0B
+    const val ACK: Byte = 0x05
+    const val NACK: Byte = 0x06
+    const val FILE_DONE: Byte = 0x07
+    const val CANCEL: Byte = 0x08
+    const val DONE: Byte = 0x09
+    const val PING: Byte = 0x0A
+    const val PONG: Byte = PING
 }
 
 class RawFrame(val type: Byte, val payload: ByteArray) {
@@ -81,14 +81,7 @@ data class FileMeta(
     val sha256: ByteArray
 ) {
     fun validate() {
-        require(size >= 0) { "File size cannot be negative: $size" }
-        require(id.isNotBlank()) { "File id cannot be blank" }
-        require(!name.contains("..") && !name.contains("/") && !name.contains("\\")) {
-            "Path traversal rejected in file name: $name"
-        }
-        require(name.none { it.code < 32 }) {
-            "Control characters rejected in file name: $name"
-        }
+        ProtocolBounds.validateFile(this)
     }
 }
 
@@ -98,14 +91,7 @@ data class ManifestMessage(
     val chunkSize: Int = 4 * 1024 * 1024
 ) {
     fun validate() {
-        require(files.isNotEmpty()) { "Manifest file list cannot be empty" }
-        require(files.size <= 1000) { "Manifest file count exceeds cap of 1000: ${files.size}" }
-        require(chunkSize in 64 * 1024..8 * 1024 * 1024) {
-            "Chunk size outside allowed bounds [64KB, 8MB]: $chunkSize"
-        }
-        for (f in files) {
-            f.validate()
-        }
+        ProtocolBounds.validateManifest(this)
     }
 }
 
@@ -130,7 +116,8 @@ data class AckMessage(
 @Serializable
 data class NackMessage(
     val fileId: String,
-    val chunkIndices: List<Int>
+    val chunkIndices: List<Int>,
+    val reason: String = "RETRY_REQUESTED"
 )
 
 @Serializable
@@ -142,4 +129,11 @@ data class FileDoneMessage(
 @Serializable
 data class CancelMessage(
     val reason: String
+)
+
+
+@Serializable
+data class PingPongMessage(
+    val ts: Long = 0,
+    val reply: Boolean = false
 )
