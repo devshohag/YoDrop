@@ -1,28 +1,32 @@
-﻿package com.yodrop.android.ble
+package com.yodrop.android.ble
 
-import kotlinx.serialization.ExperimentalSerializationApi
-import kotlinx.serialization.cbor.Cbor
-import kotlinx.serialization.decodeFromByteArray
-import kotlinx.serialization.encodeToByteArray
 
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
 import android.os.ParcelUuid
+import android.os.Build
 import com.yodrop.core.protocol.*
+import com.yodrop.core.session.BlePeerMessage
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.channels.Channel
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 @SuppressLint("MissingPermission")
-@OptIn(ExperimentalSerializationApi::class)
 class AndroidBleManager(
     private val context: Context,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val localHello: HelloMessage
 ) {
-    private val bleCbor = Cbor { ignoreUnknownKeys = true }
+    private val txMutex = Mutex()
+    private val devices = ConcurrentHashMap<String, BluetoothDevice>()
+    private val serverPeers = ConcurrentHashMap.newKeySet<String>()
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? = bluetoothManager.adapter
@@ -35,19 +39,29 @@ class AndroidBleManager(
     private val writeUuid = UUID.fromString(Uuids.CHAR_WRITE_UUID_STRING)
     private val notifyUuid = UUID.fromString(Uuids.CHAR_NOTIFY_UUID_STRING)
 
-    private val reassembler = BleFragmenter.Reassembler()
+    private var reassembler = BleFragmenter.Reassembler()
     private var txCounter = 0
 
-    private val _incomingMessages = MutableSharedFlow<BleControlMessage>(replay = 0)
+    private val _incomingMessages = MutableSharedFlow<BlePeerMessage>(replay = 0)
     val incomingMessages = _incomingMessages.asSharedFlow()
+    private val decodedMessages = Channel<BlePeerMessage>(Channel.BUFFERED)
 
-    private val _discoveredOffers = MutableSharedFlow<OfferMessage>(replay = 1)
-    val discoveredOffers = _discoveredOffers.asSharedFlow()
+    init {
+        scope.launch {
+            for (message in decodedMessages) _incomingMessages.emit(message)
+        }
+    }
+
+    private val _errors = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    val errors = _errors.asSharedFlow()
 
     fun isBluetoothEnabled(): Boolean = adapter?.isEnabled == true
 
     fun startAdvertising(offer: OfferMessage) {
-        advertiser = adapter?.bluetoothLeAdvertiser ?: return
+        advertiser = adapter?.bluetoothLeAdvertiser ?: run {
+            _errors.tryEmit("Bluetooth advertising is unavailable on this device.")
+            return
+        }
         openGattServer()
 
         val settings = AdvertiseSettings.Builder()
@@ -57,9 +71,8 @@ class AndroidBleManager(
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
 
-        val offerBytes = bleCbor.encodeToByteArray(OfferMessage.serializer(), offer)
-        // Service Data truncated if too large; full data served through GATT
-        val serviceData = if (offerBytes.size <= 24) offerBytes else offer.sessionId
+        // Discovery hint only. The complete typed OFFER is sent over GATT after HELLO.
+        val serviceData = offer.sessionId.copyOf()
 
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
@@ -72,11 +85,14 @@ class AndroidBleManager(
 
     fun stopAdvertising() {
         advertiser?.stopAdvertising(advertiseCallback)
-        closeGattServer()
+        // Keep GATT alive for CLAIM/ACCEPT after advertising stops.
     }
 
     fun startScanning() {
-        scanner = adapter?.bluetoothLeScanner ?: return
+        scanner = adapter?.bluetoothLeScanner ?: run {
+            _errors.tryEmit("Bluetooth scanning is unavailable on this device.")
+            return
+        }
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(serviceUuid))
             .build()
@@ -89,39 +105,52 @@ class AndroidBleManager(
 
     fun stopScanning() {
         scanner?.stopScan(scanCallback)
-        activeGattClient?.close()
-        activeGattClient = null
+        // Stopping discovery must not disconnect the selected offer peer.
     }
 
-    fun sendControlMessage(device: BluetoothDevice?, message: BleControlMessage) {
-        val bytes = when (message) {
-            is HelloMessage -> bleCbor.encodeToByteArray(HelloMessage.serializer(), message)
-            is OfferMessage -> bleCbor.encodeToByteArray(OfferMessage.serializer(), message)
-            is ClaimMessage -> bleCbor.encodeToByteArray(ClaimMessage.serializer(), message)
-            is DecisionMessage -> bleCbor.encodeToByteArray(DecisionMessage.serializer(), message)
-            is LinkInfoMessage -> bleCbor.encodeToByteArray(LinkInfoMessage.serializer(), message)
-        }
-
-        val packets = BleFragmenter.fragment(msgId = txCounter++, data = bytes, mtu = 240)
-        scope.launch(Dispatchers.IO) {
-            for (pkt in packets) {
-                if (gattServer != null && device != null) {
-                    val char = gattServer?.getService(serviceUuid)?.getCharacteristic(notifyUuid)
-                    if (char != null) {
-                        char.value = pkt
-                        gattServer?.notifyCharacteristicChanged(device, char, false)
+    suspend fun sendControlMessage(peerId: String, message: BleControlMessage) = withContext(Dispatchers.IO) {
+        txMutex.withLock {
+            val device = checkNotNull(devices[peerId]) { "Unknown BLE peer" }
+            val bytes = BleMessageCodec.encode(message)
+            val packets = BleFragmenter.fragment(msgId = txCounter++, data = bytes, mtu = 240)
+            for (packet in packets) {
+                if (peerId in serverPeers) {
+                    val server = checkNotNull(gattServer) { "GATT server unavailable" }
+                    val char = checkNotNull(server.getService(serviceUuid)?.getCharacteristic(notifyUuid))
+                    char.value = packet
+                    check(server.notifyCharacteristicChanged(device, char, false)) { "BLE notify could not start" }
+                } else {
+                    val client = checkNotNull(activeGattClient?.takeIf { it.device.address == peerId }) {
+                        "BLE peer is not connected"
                     }
-                } else if (activeGattClient != null) {
-                    val service = activeGattClient?.getService(serviceUuid)
-                    val char = service?.getCharacteristic(writeUuid)
-                    if (char != null) {
-                        char.value = pkt
-                        activeGattClient?.writeCharacteristic(char)
-                    }
+                    val char = checkNotNull(client.getService(serviceUuid)?.getCharacteristic(writeUuid))
+                    char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    char.value = packet
+                    check(client.writeCharacteristic(char)) { "BLE write could not start" }
                 }
-                delay(15) // throttle inter-packet BLE gap
+                delay(15) // Step 13 replaces throttling with a callback-driven operation queue.
             }
         }
+    }
+
+    private fun launchBle(block: suspend () -> Unit) {
+        scope.launch {
+            try { block() }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { _errors.emit("Bluetooth operation failed. Please try again.") }
+        }
+    }
+
+    fun close() {
+        runCatching { stopScanning() }
+        runCatching { stopAdvertising() }
+        runCatching { activeGattClient?.disconnect() }
+        runCatching { activeGattClient?.close() }
+        activeGattClient = null
+        closeGattServer()
+        devices.clear()
+        serverPeers.clear()
+        reassembler = BleFragmenter.Reassembler()
     }
 
     private fun openGattServer() {
@@ -152,7 +181,9 @@ class AndroidBleManager(
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {}
-        override fun onStartFailure(errorCode: Int) {}
+        override fun onStartFailure(errorCode: Int) {
+            _errors.tryEmit("Bluetooth advertising failed ($errorCode).")
+        }
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -162,6 +193,7 @@ class AndroidBleManager(
             if (sData.size >= 16) {
                 // If device found, connect GATT to exchange OFFER/CLAIM
                 if (activeGattClient == null) {
+                    devices[result.device.address] = result.device
                     activeGattClient = result.device.connectGatt(context, false, gattClientCallback, BluetoothDevice.TRANSPORT_LE)
                 }
             }
@@ -178,21 +210,27 @@ class AndroidBleManager(
             offset: Int,
             value: ByteArray?
         ) {
+            val valid = device != null && characteristic?.uuid == writeUuid &&
+                !preparedWrite && offset == 0 && value != null
             if (responseNeeded) {
-                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+                gattServer?.sendResponse(device, requestId,
+                    if (valid) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED,
+                    offset, null)
             }
-            if (value != null) {
-                val full = reassembler.onPacketReceived(value)
-                if (full != null) {
-                    parseAndDispatchMessage(full)
-                }
+            if (valid) {
+                val peer = checkNotNull(device)
+                devices[peer.address] = peer
+                serverPeers.add(peer.address)
+                val full = reassembler.onPacketReceived(checkNotNull(value))
+                if (full != null) parseAndDispatchMessage(peer.address, full)
             }
         }
     }
 
     private val gattClientCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
+            if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
+                gatt?.device?.let { devices[it.address] = it }
                 gatt?.requestMtu(247)
             }
         }
@@ -209,40 +247,45 @@ class AndroidBleManager(
             if (descriptor != null) {
                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 gatt.writeDescriptor(descriptor)
+            } else {
+                sendHello(gatt)
             }
+        }
+
+        override fun onDescriptorWrite(gatt: BluetoothGatt?, descriptor: BluetoothGattDescriptor?, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) sendHello(gatt)
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt?, characteristic: BluetoothGattCharacteristic?) {
-            val value = characteristic?.value ?: return
-            val full = reassembler.onPacketReceived(value)
-            if (full != null) {
-                parseAndDispatchMessage(full)
+            if (Build.VERSION.SDK_INT < 33) {
+                characteristic?.value?.let { onNotify(gatt, characteristic, it) }
             }
         }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray
+        ) = onNotify(gatt, characteristic, value)
     }
 
-    private fun parseAndDispatchMessage(bytes: ByteArray) {
-        scope.launch {
-            try {
-                // Determine message by deserializing candidates
-                val claim = runCatching { bleCbor.decodeFromByteArray(ClaimMessage.serializer(), bytes) }.getOrNull()
-                if (claim != null) {
-                    _incomingMessages.emit(claim)
-                    return@launch
-                }
-                val decision = runCatching { bleCbor.decodeFromByteArray(DecisionMessage.serializer(), bytes) }.getOrNull()
-                if (decision != null) {
-                    _incomingMessages.emit(decision)
-                    return@launch
-                }
-                val offer = runCatching { bleCbor.decodeFromByteArray(OfferMessage.serializer(), bytes) }.getOrNull()
-                if (offer != null) {
-                    _discoveredOffers.emit(offer)
-                    _incomingMessages.emit(offer)
-                    return@launch
-                }
-            } catch (_: Exception) {}
+    private fun sendHello(gatt: BluetoothGatt?) {
+        val peer = gatt?.device ?: return
+        devices[peer.address] = peer
+        launchBle { sendControlMessage(peer.address, localHello) }
+    }
+
+    private fun onNotify(gatt: BluetoothGatt?, characteristic: BluetoothGattCharacteristic?, value: ByteArray) {
+        if (characteristic?.uuid != notifyUuid) return
+        val peer = gatt?.device ?: return
+        devices[peer.address] = peer
+        val full = reassembler.onPacketReceived(value)
+        if (full != null) parseAndDispatchMessage(peer.address, full)
+    }
+
+    private fun parseAndDispatchMessage(peerId: String, bytes: ByteArray) {
+        // One discriminator, one decoder; malformed/unknown messages never enter the flow.
+        val message = runCatching { BleMessageCodec.decode(bytes) }.getOrNull() ?: return
+        if (decodedMessages.trySend(BlePeerMessage(peerId, message)).isFailure) {
+            _errors.tryEmit("Bluetooth receive queue is full. Please try again.")
         }
     }
 }
-

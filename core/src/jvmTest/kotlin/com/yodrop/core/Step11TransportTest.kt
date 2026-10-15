@@ -141,7 +141,7 @@ class Step11TransportTest {
             val owner = CoroutineScope(SupervisorJob() + Dispatchers.Default)
             val sender = SenderStateMachine(owner)
             try {
-                val peer = HelloMessage("Receiver", Platform.IOS, DeviceCaps.CAP_HOTSPOT_CLIENT)
+                val peer = HelloMessage("Receiver", Platform.IOS, DeviceCaps.CAP_HOTSPOT_CLIENT, ByteArray(16))
                 assertFailsWith<IllegalStateException> {
                     sender.selectTransport(Platform.ANDROID, DeviceCaps.CAP_HOTSPOT_HOST, peer)
                 }

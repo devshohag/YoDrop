@@ -336,3 +336,44 @@
   The credential data used by AndroidHotspotManager stays in HotspotCredentials.kt
   with explicit values. The earlier Step 2 note about the removed manager is historical.
 - No dependency, BLE wire message, frame numbering or session timeout changed.
+
+## [Step 12] Typed BLE control and tap handshake
+- BLE control bytes are one message-type byte followed by that concrete type's
+  CBOR payload, then the existing GATT fragmentation header is applied. Tags:
+  HELLO=01, OFFER=02, CLAIM=03, ACCEPT=04, DENY=05, LINK_INFO=06. They are separate
+  from TCP frame numbering. Unknown, truncated, oversized or invalid typed payloads
+  are rejected without trying other serializers. Decision flag and tag must agree.
+- HELLO now requires a 16-byte deviceId. Android generates random identity bytes
+  once and stores them in app-private preferences; no hardware identifier is used.
+  Name/capabilities/platform/deviceId are exchanged in both directions.
+- Advertisements carry only the session ID discovery hint. After client HELLO,
+  the sender sends its HELLO and complete typed OFFER through fragmented GATT
+  notifications. HELLO/OFFER receive ordering is preserved by a bounded channel.
+- Shared BleHandshakeController binds HELLO/OFFER/CLAIM/decision/LINK_INFO to opaque
+  platform peer IDs. It uses the actual sender and receiver machines, preserves
+  first-claim ownership and requires a tap before sending CLAIM. Discovery metadata
+  is bounded to 16 peers. UI shows the peer name, full file summary and verify code.
+- MainActivity now starts real advertising/scanning, collects typed peer messages
+  and dispatches receiver tap CLAIM/ACCEPT/DENY. It requests the BLE permissions
+  needed by these actions and checks Bluetooth availability. Full foreground,
+  Wi-Fi/service permission/lifecycle work remains Step 18.
+- The sender calls the Step 11 Android selector after CLAIM with that peer's HELLO
+  and remembers the result. Unknown peer LAN IP still skips LAN; no IP is guessed.
+- Explicit ACCEPT transitions both machines to Linking with nullable linkInfo
+  while the sender prepares the real endpoint. Existing injected-link calls stay
+  supported. The receiver can accept its selected peer's LINK_INFO exactly once
+  after consent, without fabricating localhost or any gateway IP. The original
+  20-second linking deadline remains active. No TCP socket is attached by this step.
+- Stopping advertising/scanning preserves the GATT connection needed by the rest
+  of the handshake. Reset/destruction closes it. API 33+ notification callbacks use
+  supplied value bytes; older versions retain the legacy callback.
+- Both apps must update together: typed framing and required HELLO identity are
+  intentionally incompatible with the old untyped/trial-decoding BLE messages.
+- Step 13 still owns CCCD server support, callback-driven operations, negotiated
+  MTU, peer-isolated reassembly and disconnect recovery. The existing delay(15)
+  and fixed packet size remain explicitly pending there. Reliable notification
+  delivery and physical-phone pairing are not established by JVM tests.
+- Step 14 owns sender endpoint creation and encrypted LINK_INFO. The typed
+  LINK_INFO dispatcher in this step is not a claim of credential confidentiality.
+  Small BLE payload transfer, Wi-Fi Direct/hotspot data setup and bulk Android
+  transfer remain their later steps. No dependency or TCP wire/timeouts changed.

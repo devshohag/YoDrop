@@ -1,5 +1,8 @@
 package com.yodrop.android
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.util.Base64
 import android.content.ContentValues
 import android.os.Build
 import android.os.Bundle
@@ -11,13 +14,21 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.lifecycleScope
 import com.yodrop.android.ui.MainScreen
+import com.yodrop.android.ble.AndroidBleManager
+import com.yodrop.android.transport.AndroidSenderTransportSelector
+import com.yodrop.core.crypto.CryptoEngine
+import com.yodrop.core.protocol.DeviceCaps
+import com.yodrop.core.protocol.HelloMessage
+import com.yodrop.core.protocol.Platform
+import com.yodrop.core.session.BleHandshakeController
+import com.yodrop.core.session.SenderState
+import com.yodrop.core.session.ReceiverState
+import kotlinx.coroutines.flow.collect
 import com.yodrop.core.platform.DiskFileSink
 import com.yodrop.core.platform.DiskFileSource
 import com.yodrop.core.platform.FileSink
 import com.yodrop.core.platform.FileSource
 import com.yodrop.core.protocol.FileMeta
-import com.yodrop.core.protocol.LinkInfoMessage
-import com.yodrop.core.protocol.LinkType
 import com.yodrop.core.session.ReceiverStateMachine
 import com.yodrop.core.session.SenderStateMachine
 import java.io.File
@@ -46,6 +57,18 @@ class MainActivity : ComponentActivity() {
     }
 
 
+    private lateinit var ble: AndroidBleManager
+    private lateinit var handshake: BleHandshakeController
+    private var pendingBleAction: (() -> Unit)? = null
+    private val requestBlePermissions = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        val action = pendingBleAction
+        pendingBleAction = null
+        if (grants.isNotEmpty() && grants.values.all { it }) action?.let { withBlePermissions(it) }
+        else Toast.makeText(this, "Bluetooth permissions are required", Toast.LENGTH_LONG).show()
+    }
+
     private lateinit var senderMachine: SenderStateMachine
     private lateinit var receiverMachine: ReceiverStateMachine
 
@@ -59,46 +82,133 @@ class MainActivity : ComponentActivity() {
             sinkFactory = { meta -> createScopedStorageFileSink(meta) }
         )
 
+        val hello = HelloMessage(
+            deviceName = Build.MODEL.ifBlank { "Android" }.take(64),
+            platform = Platform.ANDROID,
+            capabilities = DeviceCaps.CAP_BLE or DeviceCaps.CAP_LAN or
+                DeviceCaps.CAP_HOTSPOT_HOST or DeviceCaps.CAP_HOTSPOT_CLIENT or
+                (if (packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_DIRECT))
+                    DeviceCaps.CAP_WIFI_DIRECT else 0),
+            deviceId = persistentDeviceId()
+        )
+        ble = AndroidBleManager(this, lifecycleScope, hello)
+        val selector = AndroidSenderTransportSelector(this, senderMachine)
+        handshake = BleHandshakeController(senderMachine, receiverMachine, hello,
+            selectTransport = { peer -> selector.selectTransport(hello.capabilities, peer) }
+        ) { peer, message ->
+            ble.sendControlMessage(peer, message)
+        }
+        lifecycleScope.launch {
+            ble.incomingMessages.collect { event ->
+                try { handshake.onMessage(event) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { showBleError() }
+            }
+        }
+        lifecycleScope.launch {
+            ble.errors.collect { error ->
+                Toast.makeText(this@MainActivity, error, Toast.LENGTH_LONG).show()
+            }
+        }
+        lifecycleScope.launch {
+            senderMachine.state.collect { state ->
+                try {
+                    if (state is SenderState.Advertising) ble.startAdvertising(state.offer)
+                    else ble.stopAdvertising()
+                } catch (_: SecurityException) { showBleError() }
+            }
+        }
+        lifecycleScope.launch {
+            receiverMachine.state.collect { state ->
+                try {
+                    if (state !is ReceiverState.Scanning) ble.stopScanning()
+                } catch (_: SecurityException) { showBleError() }
+            }
+        }
+
         setContent {
             val senderState by senderMachine.state.collectAsState()
             val receiverState by receiverMachine.state.collectAsState()
+            val peerName by handshake.peerName.collectAsState()
 
             MainScreen(
                 senderState = senderState,
                 receiverState = receiverState,
-                onSendClick = { pickSendFile.launch(arrayOf("*/*")) },
+                peerName = peerName,
+                onSendClick = { withBlePermissions { pickSendFile.launch(arrayOf("*/*")) } },
                 onReceiveClick = {
-                    lifecycleScope.launch { receiverMachine.startScanning() }
+                    withBlePermissions {
+                        launchBleAction {
+                            if (receiverMachine.startScanning()) ble.startScanning()
+                        }
+                    }
+                },
+                onClaimClick = {
+                    launchBleAction {
+                        if (handshake.claim()) ble.stopScanning()
+                    }
                 },
                 onAcceptClick = {
-                    val fallbackLink = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 8888)
-                    lifecycleScope.launch {
-                        try {
-                            receiverMachine.acceptTransfer(fallbackLink)
-                        } catch (_: IllegalStateException) {
-                            // A stale/repeated UI action is rejected by the core.
-                        }
-                    }
+                    launchBleAction { handshake.accept() }
                 },
                 onDenyClick = {
-                    lifecycleScope.launch {
-                        try {
-                            receiverMachine.denyTransfer("User declined")
-                        } catch (_: IllegalStateException) {
-                            // Prompt may already have been dismissed.
-                        }
-                    }
+                    launchBleAction { handshake.deny() }
                 },
                 onCancelClick = {
                     lifecycleScope.launch {
                         senderMachine.cancel("User cancelled")
                         receiverMachine.cancel("User cancelled")
+                        ble.close()
+                        handshake.reset()
                         senderMachine.reset()
                         receiverMachine.reset()
                     }
                 }
             )
         }
+    }
+
+    private fun persistentDeviceId(): ByteArray {
+        val prefs = getSharedPreferences("yodrop_identity", MODE_PRIVATE)
+        val saved = runCatching {
+            prefs.getString("device_id", null)?.let { Base64.decode(it, Base64.NO_WRAP) }
+        }.getOrNull()
+        if (saved?.size == 16) return saved
+        return CryptoEngine.randomBytes(16).also {
+            prefs.edit().putString("device_id", Base64.encodeToString(it, Base64.NO_WRAP)).apply()
+        }
+    }
+
+    private fun withBlePermissions(action: () -> Unit) {
+        val permissions = if (Build.VERSION.SDK_INT >= 31) arrayOf(
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.BLUETOOTH_CONNECT
+        ) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        val missing = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) {
+            pendingBleAction = action
+            requestBlePermissions.launch(missing.toTypedArray())
+        } else if (!ble.isBluetoothEnabled()) {
+            Toast.makeText(this, "Turn on Bluetooth and try again", Toast.LENGTH_LONG).show()
+        } else action()
+    }
+
+    private fun launchBleAction(action: suspend () -> Unit) {
+        lifecycleScope.launch {
+            try { action() }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { showBleError() }
+        }
+    }
+
+    private fun showBleError() {
+        Toast.makeText(this, "Bluetooth operation failed. Please try again.", Toast.LENGTH_LONG).show()
+    }
+
+    override fun onDestroy() {
+        if (::ble.isInitialized) ble.close()
+        super.onDestroy()
     }
 
     private fun startUriSendFlow(uri: Uri) {

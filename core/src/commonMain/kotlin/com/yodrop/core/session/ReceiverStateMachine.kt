@@ -195,7 +195,7 @@ class ReceiverStateMachine(
         ClaimMessage(offer.sessionId.copyOf(), keyPair.publicKey.copyOf())
     }
 
-    suspend fun acceptTransfer(linkInfo: LinkInfoMessage): DecisionMessage =
+    suspend fun acceptTransfer(linkInfo: LinkInfoMessage? = null): DecisionMessage =
         eventMutex.withLock {
             check(scope.isActive &&
                 SessionPolicy.receiver(_state.value, SessionEvent.ACCEPT)) {
@@ -211,6 +211,16 @@ class ReceiverStateMachine(
             ) { _state.value is ReceiverState.Linking }
             DecisionMessage(offer.sessionId.copyOf(), true)
         }
+
+    /** Only the accepted offer's BLE peer may supply this through the handshake controller. */
+    suspend fun onLinkInfoReceived(linkInfo: LinkInfoMessage): Boolean = eventMutex.withLock {
+        val current = _state.value as? ReceiverState.Linking ?: return@withLock false
+        if (current.linkInfo != null || linkInfo.host.isBlank() || linkInfo.port !in 1..65535) {
+            return@withLock false
+        }
+        publishLocked(ReceiverState.Linking(linkInfo))
+        true
+    }
 
     suspend fun denyTransfer(
         reason: String = "User rejected"

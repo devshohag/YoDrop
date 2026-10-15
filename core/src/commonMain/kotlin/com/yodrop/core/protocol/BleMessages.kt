@@ -32,7 +32,8 @@ sealed interface BleControlMessage
 data class HelloMessage(
     val deviceName: String,
     val platform: Platform,
-    val capabilities: Int
+    val capabilities: Int,
+    val deviceId: ByteArray
 ) : BleControlMessage
 
 @Serializable

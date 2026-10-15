@@ -202,7 +202,7 @@ class SenderStateMachine(
 
     suspend fun onDecisionReceived(
         decision: DecisionMessage,
-        linkInfo: LinkInfoMessage
+        linkInfo: LinkInfoMessage? = null
     ): Boolean = eventMutex.withLock {
         if (!scope.isActive ||
             !SessionPolicy.sender(_state.value, SessionEvent.DECISION)) {

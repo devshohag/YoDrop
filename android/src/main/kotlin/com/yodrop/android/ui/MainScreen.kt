@@ -14,6 +14,8 @@ fun MainScreen(
     senderState: SenderState,
     receiverState: ReceiverState,
     onSendClick: () -> Unit,
+    onClaimClick: () -> Unit,
+    peerName: String?,
     onReceiveClick: () -> Unit,
     onAcceptClick: () -> Unit,
     onDenyClick: () -> Unit,
@@ -51,11 +53,20 @@ fun MainScreen(
 
             receiverState is ReceiverState.Scanning -> {
                 Text("Waiting for an offer...")
-                Text(
-                    "BLE discovery wiring is pending.",
-                    modifier = Modifier.padding(top = 8.dp)
-                )
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Cancel")
+                }
             }
+            receiverState is ReceiverState.OfferSeen -> {
+                Text("From: ${peerName ?: "Nearby device"}")
+                Text(receiverState.offer.previewName, modifier = Modifier.padding(top = 8.dp))
+                Text("${receiverState.offer.fileCount} file(s), ${receiverState.offer.totalBytes} bytes")
+                Button(onClick = onClaimClick, modifier = Modifier.padding(top = 16.dp)) {
+                    Text("Receive this file")
+                }
+                OutlinedButton(onClick = onCancelClick) { Text("Cancel") }
+            }
+
             senderState is SenderState.Advertising -> {
                 CircularProgressIndicator()
                 Text("Advertising... Waiting for receiver", modifier = Modifier.padding(top = 16.dp))
@@ -78,7 +89,8 @@ fun MainScreen(
             }
 
             receiverState is ReceiverState.AcceptPrompt -> {
-                Text("Incoming Transfer from ${receiverState.offer.previewName}")
+                Text("From: ${peerName ?: "Nearby device"}")
+                Text("Incoming file: ${receiverState.offer.previewName}")
                 Text(
                     text = receiverState.verifyCode,
                     style = MaterialTheme.typography.displayMedium,
@@ -96,6 +108,17 @@ fun MainScreen(
                         Text("Deny")
                     }
                 }
+            }
+
+            senderState is SenderState.Linking || receiverState is ReceiverState.Linking -> {
+                CircularProgressIndicator()
+                Text("Accepted. Setting up connection...", modifier = Modifier.padding(top = 16.dp))
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) { Text("Cancel") }
+            }
+
+            senderState is SenderState.Cancelled || receiverState is ReceiverState.Cancelled -> {
+                Text("Transfer cancelled")
+                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) { Text("Back to Home") }
             }
 
             senderState is SenderState.Transferring -> {
