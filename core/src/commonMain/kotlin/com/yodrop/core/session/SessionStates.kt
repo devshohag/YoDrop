@@ -14,7 +14,7 @@ sealed interface SenderState {
     data class Transferring(val progress: Float, val currentFileName: String) : SenderState
     data object Done : SenderState
     data class Cancelled(val reason: String) : SenderState
-    data class Failed(val error: String) : SenderState
+    data class Failed(val error: String, val canResume: Boolean = false) : SenderState
 }
 
 sealed interface ReceiverState {
@@ -29,6 +29,6 @@ sealed interface ReceiverState {
     data class Verifying(val fileId: String) : ReceiverState
     data object Done : ReceiverState
     data class Cancelled(val reason: String) : ReceiverState
-    data class Failed(val error: String) : ReceiverState
+    data class Failed(val error: String, val canResume: Boolean = false) : ReceiverState
 }
 

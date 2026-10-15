@@ -47,13 +47,30 @@ class ReceiverStateMachine(
     private var myKeyPair: KeyPair? = null
     private var sessionKeys: SessionKeys? = null
     private var activeOffer: OfferMessage? = null
-    private var activeConnection: Connection? = null
+    private var activeConnection: SessionConnection? = null
     private var worker: Job? = null
     private var promptJob: Job? = null
     private var cleanupJob: Job? = null
+    private var linksClosed = CompletableDeferred<Unit>()
+    private var cleanupStarted = false
+    private var lifetimeJob: Job? = null
+    private var reconnectJob: Job? = null
+    private val sinks = mutableMapOf<String, FileSink>()
+    private val committedFiles = mutableSetOf<String>()
+    private var sessionManifest: ManifestMessage? = null
     private var claimWindowJob: Job? = null
     private var acceptTimeoutJob: Job? = null
     private var linkingTimeoutJob: Job? = null
+
+    private fun watchLifetime() {
+        lifetimeJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                awaitCancellation()
+            } finally {
+                withContext(NonCancellable) { this@ReceiverStateMachine.cancel("Receiver scope cancelled") }
+            }
+        }
+    }
 
     private fun copyOffer(offer: OfferMessage): OfferMessage = offer.copy(
         sessionId = offer.sessionId.copyOf(),
@@ -109,6 +126,7 @@ class ReceiverStateMachine(
             !SessionPolicy.receiver(_state.value, SessionEvent.SCAN)) {
             return@withLock false
         }
+        watchLifetime()
         publishLocked(ReceiverState.Scanning)
         true
     }
@@ -211,16 +229,29 @@ class ReceiverStateMachine(
             }
 
             linkingTimeoutJob?.cancel()
-            activeConnection = connection
+            reconnectJob?.cancel()
+            val wire = SessionConnection(connection, timeouts)
+            activeConnection = wire
             publishLocked(ReceiverState.Auth)
             worker = scope.launch {
                 try {
-                    runReceiveLoop(connection)
+                    wire.run { runReceiveLoop(it) }
                 } catch (e: CancellationException) {
-                    cancel("Cancelled by receiver")
+                    withContext(NonCancellable) { this@ReceiverStateMachine.cancel("Receiver scope cancelled") }
                     throw e
-                } catch (e: Throwable) {
+                } catch (e: PeerCancelledException) {
+                    cancel(e.reason, notifyPeer = false)
+                } catch (e: ConnectionLostException) {
+                    connectionLost(wire, e)
+                } catch (e: Exception) {
                     fail("Receive failed: ${e.message}")
+                } finally {
+                    withContext(NonCancellable) {
+                        runCatching { wire.close() }
+                        eventMutex.withLock {
+                            if (activeConnection === wire) activeConnection = null
+                        }
+                    }
                 }
             }
             true
@@ -232,14 +263,12 @@ class ReceiverStateMachine(
 
         val peerAuthFrame = readProtocolFrame(connection)
         if (peerAuthFrame.type != FrameType.AUTH) {
-            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Expected AUTH frame")))
             fail("Expected AUTH frame, got ${peerAuthFrame.type}")
             return
         }
 
         val peerAuthMsg = ProtocolCodec.decodePayload<AuthMessage>(peerAuthFrame)
         if (!CryptoEngine.constantTimeEquals(peerAuthMsg.sessionId, sid)) {
-            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("SessionId mismatch")))
             fail("SessionId mismatch in AUTH")
             return
         }
@@ -247,7 +276,6 @@ class ReceiverStateMachine(
         val expectedSenderAuthPayload = "authsender".encodeToByteArray() + sid
         val expectedSenderTag = CryptoEngine.computeHmacSha256(keys.senderToReceiverKey, expectedSenderAuthPayload)
         if (!CryptoEngine.constantTimeEquals(peerAuthMsg.authTag, expectedSenderTag)) {
-            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("AUTH tag verification failed")))
             fail("AUTH tag verification failed")
             return
         }
@@ -261,13 +289,12 @@ class ReceiverStateMachine(
         require(manifestFrame.type == FrameType.MANIFEST) { "Expected MANIFEST frame" }
         val manifest = ProtocolCodec.decodePayload<ManifestMessage>(manifestFrame)
         
-        try {
-            manifest.validate()
-        } catch (e: Exception) {
-            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Invalid manifest: ${e.message}")))
-            fail("Invalid manifest: ${e.message}")
-            return
+        manifest.validate()
+        val previous = sessionManifest
+        require(previous == null || sameManifest(previous, manifest)) {
+            "Manifest changed on reconnect"
         }
+        sessionManifest = manifest
 
         for ((fileIdx, file) in manifest.files.withIndex()) {
             val totalChunks = ChunkPlanner.calculateTotalChunks(file.size, manifest.chunkSize)
@@ -275,140 +302,156 @@ class ReceiverStateMachine(
             if (!setState(ReceiverState.Receiving(
                     fileIdx.toFloat() / manifest.files.size, file.name
                 ))) return
-            val sink = sinkFactory(file)
+            if (file.id in committedFiles) {
+                connection.writeFrame(ProtocolCodec.encodeToFrame(
+                    FrameType.FILE_DONE, FileDoneMessage(file.id, true)
+                ))
+                continue
+            }
+            val sink = sinks.getOrPut(file.id) { sinkFactory(file) }
 
-            try {
-                while (!bitmap.isComplete() && !connection.isClosed) {
-                    val missing = bitmap.getMissingChunks(batchSize = 16)
-                    if (missing.isEmpty()) break
+            while (!bitmap.isComplete()) {
+                val missing = bitmap.getMissingChunks(batchSize = 16)
+                if (missing.isEmpty()) break
 
-                    val reqMsg = ChunkReqMessage(fileId = file.id, chunkIndices = missing)
-                    connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CHUNK_REQ, reqMsg))
+                val reqMsg = ChunkReqMessage(fileId = file.id, chunkIndices = missing)
+                connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CHUNK_REQ, reqMsg))
 
-                    val pending = missing.toMutableSet()
-                    repeat(missing.size) {
-                        val dataFrame = readProtocolFrame(connection)
-                        require(dataFrame.type == FrameType.CHUNK_DATA) { "Expected CHUNK_DATA frame" }
+                val pending = missing.toMutableSet()
+                repeat(missing.size) {
+                    val dataFrame = readProtocolFrame(connection)
+                    require(dataFrame.type == FrameType.CHUNK_DATA) { "Expected CHUNK_DATA frame" }
 
-                        val payload = dataFrame.payload
-                        require(payload.size >= 26) { "Truncated chunk header" }
-                        val idLen = payload[0].toInt() and 0xFF
-                        require(idLen in 1..128 &&
-                            payload.size >= 1 + idLen + 8 + 16) {
-                            "Invalid chunk header"
-                        }
-                        val fileId = payload.decodeToString(
-                            1, 1 + idLen, throwOnInvalidSequence = true
-                        )
-                        require(fileId == file.id) { "Wrong chunk file id" }
-                        var off = 1 + idLen
-                        val chunkIdx = ((payload[off].toInt() and 0xFF) shl 24) or
-                                ((payload[off + 1].toInt() and 0xFF) shl 16) or
-                                ((payload[off + 2].toInt() and 0xFF) shl 8) or
-                                (payload[off + 3].toInt() and 0xFF)
-                        off += 4
-                        val attemptCounter = ((payload[off].toInt() and 0xFF) shl 24) or
-                                ((payload[off + 1].toInt() and 0xFF) shl 16) or
-                                ((payload[off + 2].toInt() and 0xFF) shl 8) or
-                                (payload[off + 3].toInt() and 0xFF)
-                        off += 4
-                        require(pending.remove(chunkIdx)) {
-                            "Unrequested or duplicate chunk index"
-                        }
-                        require(attemptCounter >= 0) {
-                            "Invalid attempt counter"
-                        }
-                        val (chunkStart, chunkEnd) =
-                            ChunkPlanner.getChunkByteRange(
-                                chunkIdx, file.size, manifest.chunkSize
-                            )
-                        val expectedLength = (chunkEnd - chunkStart).toInt()
-                        require(payload.size - off == expectedLength + 16) {
-                            "Wrong encrypted chunk length"
-                        }
-                        val ciphertext = payload.copyOfRange(off, payload.size)
-
-                        val nonce = NonceUtils.buildChunkNonce(keys.nonceBase, chunkIdx, attemptCounter)
-                        val aad = NonceUtils.buildAad(sid, fileId, chunkIdx)
-                        val plaintext = CryptoEngine.decryptAesGcm(keys.senderToReceiverKey, nonce, ciphertext, aad)
-
-                        require(plaintext.size == expectedLength) {
-                            "Wrong plaintext chunk length"
-                        }
-                        val start = chunkStart
-                        sink.writeChunk(start, plaintext)
-                        bitmap.markReceived(chunkIdx)
-
-                        resumeStore.saveBitmap(sid, file.id, bitmap)
-
-                        val fileProgress = (fileIdx + (chunkIdx + 1).toFloat() / totalChunks.toFloat()) / manifest.files.size.toFloat()
-                        if (!setState(ReceiverState.Receiving(fileProgress, file.name))) return
+                    val payload = dataFrame.payload
+                    require(payload.size >= 26) { "Truncated chunk header" }
+                    val idLen = payload[0].toInt() and 0xFF
+                    require(idLen in 1..128 &&
+                        payload.size >= 1 + idLen + 8 + 16) {
+                        "Invalid chunk header"
                     }
-                }
-
-                if (!setState(ReceiverState.Verifying(file.id))) return
-                val matches = sink.verifySha256(file.sha256)
-
-                if (!matches) {
-                    connection.writeFrame(
-                        ProtocolCodec.encodeToFrame(
-                            FrameType.FILE_DONE, FileDoneMessage(file.id, false)
-                        )
+                    val fileId = payload.decodeToString(
+                        1, 1 + idLen, throwOnInvalidSequence = true
                     )
-                    fail("Checksum mismatch for file ${file.name}")
-                    return
+                    require(fileId == file.id) { "Wrong chunk file id" }
+                    var off = 1 + idLen
+                    val chunkIdx = ((payload[off].toInt() and 0xFF) shl 24) or
+                            ((payload[off + 1].toInt() and 0xFF) shl 16) or
+                            ((payload[off + 2].toInt() and 0xFF) shl 8) or
+                            (payload[off + 3].toInt() and 0xFF)
+                    off += 4
+                    val attemptCounter = ((payload[off].toInt() and 0xFF) shl 24) or
+                            ((payload[off + 1].toInt() and 0xFF) shl 16) or
+                            ((payload[off + 2].toInt() and 0xFF) shl 8) or
+                            (payload[off + 3].toInt() and 0xFF)
+                    off += 4
+                    require(pending.remove(chunkIdx)) {
+                        "Unrequested or duplicate chunk index"
+                    }
+                    require(attemptCounter >= 0) {
+                        "Invalid attempt counter"
+                    }
+                    val (chunkStart, chunkEnd) =
+                        ChunkPlanner.getChunkByteRange(
+                            chunkIdx, file.size, manifest.chunkSize
+                        )
+                    val expectedLength = (chunkEnd - chunkStart).toInt()
+                    require(payload.size - off == expectedLength + 16) {
+                        "Wrong encrypted chunk length"
+                    }
+                    val ciphertext = payload.copyOfRange(off, payload.size)
+
+                    val nonce = NonceUtils.buildChunkNonce(keys.nonceBase, chunkIdx, attemptCounter)
+                    val aad = NonceUtils.buildAad(sid, fileId, chunkIdx)
+                    val plaintext = CryptoEngine.decryptAesGcm(keys.senderToReceiverKey, nonce, ciphertext, aad)
+
+                    require(plaintext.size == expectedLength) {
+                        "Wrong plaintext chunk length"
+                    }
+                    val start = chunkStart
+                    sink.writeChunk(start, plaintext)
+                    bitmap.markReceived(chunkIdx)
+
+                    resumeStore.saveBitmap(sid, file.id, bitmap)
+
+                    val fileProgress = (fileIdx + (chunkIdx + 1).toFloat() / totalChunks.toFloat()) / manifest.files.size.toFloat()
+                    if (!setState(ReceiverState.Receiving(fileProgress, file.name))) return
                 }
-                sink.commit()
-                resumeStore.clear(sid, file.id)
+            }
+
+            if (!setState(ReceiverState.Verifying(file.id))) return
+            val matches = sink.verifySha256(file.sha256)
+
+            if (!matches) {
                 connection.writeFrame(
                     ProtocolCodec.encodeToFrame(
-                        FrameType.FILE_DONE, FileDoneMessage(file.id, true)
+                        FrameType.FILE_DONE, FileDoneMessage(file.id, false)
                     )
                 )
-            } finally {
-                sink.close()
+                fail("Checksum mismatch for file ${file.name}")
+                return
             }
+            sink.commit()
+            committedFiles.add(file.id)
+            sink.close()
+            resumeStore.clear(sid, file.id)
+            connection.writeFrame(
+                ProtocolCodec.encodeToFrame(
+                    FrameType.FILE_DONE, FileDoneMessage(file.id, true)
+                )
+            )
         }
 
+        if (_state.value !is ReceiverState.Verifying) {
+            if (!setState(ReceiverState.Verifying(manifest.files.last().id))) return
+        }
         val doneFrame = readProtocolFrame(connection)
         require(doneFrame.type == FrameType.DONE) { "Expected DONE frame" }
         if (!setState(ReceiverState.Done)) return
-        cleanup()
+        eventMutex.withLock { cleanup() }
     }
 
-    private suspend fun readProtocolFrame(connection: Connection): RawFrame {
-        while (true) {
-            val frame = readFrameWithIdleTimeout(
-                connection, timeouts.socketIdleMs
-            )
-            if (frame.type != FrameType.PING) return frame
+    private suspend fun readProtocolFrame(connection: Connection): RawFrame =
+        connection.readFrame()
 
-            val ping = ProtocolCodec.decodePayload<PingPongMessage>(frame)
-            if (!ping.reply) {
-                connection.writeFrame(
-                    ProtocolCodec.encodeToFrame(
-                        FrameType.PING, ping.copy(reply = true)
-                    )
-                )
-            }
+    private fun sameManifest(a: ManifestMessage, b: ManifestMessage): Boolean =
+        a.chunkSize == b.chunkSize && a.files.size == b.files.size &&
+        a.files.zip(b.files).all { (x, y) ->
+            x.id == y.id && x.name == y.name && x.size == y.size &&
+                x.mime == y.mime && x.sha256.contentEquals(y.sha256)
         }
-    }
 
     private suspend fun fail(reason: String) {
         eventMutex.withLock {
             failLocked(reason)
         }
+        withContext(NonCancellable) { linksClosed.await() }
     }
 
     suspend fun cancel(reason: String = "User cancelled"): Boolean =
+        cancel(reason, notifyPeer = true)
+
+    private suspend fun cancel(reason: String, notifyPeer: Boolean): Boolean =
         eventMutex.withLock {
             if (!SessionPolicy.receiver(_state.value, SessionEvent.CANCEL)) {
                 return@withLock false
             }
             publishLocked(ReceiverState.Cancelled(reason))
-            cleanup()
+            cleanup(if (notifyPeer) reason else null)
             true
         }
+
+    private suspend fun connectionLost(wire: SessionConnection, failure: Throwable) {
+        eventMutex.withLock {
+            if (activeConnection !== wire || cleanupStarted ||
+                SessionPolicy.receiverTerminal(_state.value)) return@withLock
+            activeConnection = null
+            publishLocked(ReceiverState.Failed(failure.message ?: "Connection lost", canResume = true))
+            reconnectJob?.cancel()
+            reconnectJob = startTimer(timeouts.linkingMs, "Reconnect deadline expired") {
+                (_state.value as? ReceiverState.Failed)?.canResume == true
+            }
+        }
+    }
 
     suspend fun reset(): Boolean {
         val pending = eventMutex.withLock {
@@ -432,21 +475,51 @@ class ReceiverStateMachine(
             activeOffer = null
             sessionKeys = null
             myKeyPair = null
+            linksClosed = CompletableDeferred()
+            cleanupStarted = false
+            lifetimeJob = null
+            reconnectJob = null
+            sessionManifest = null
+            sinks.clear()
+            committedFiles.clear()
             publishLocked(ReceiverState.Idle)
             true
         }
     }
 
-    private fun cleanup() {
+    // All partial state is retained on link loss, discarded on terminal cleanup.
+    private fun cleanup(reason: String? = (_state.value as? ReceiverState.Failed)?.error) {
+        if (cleanupStarted) return
+        cleanupStarted = true
         claimWindowJob?.cancel()
         acceptTimeoutJob?.cancel()
         linkingTimeoutJob?.cancel()
+        reconnectJob?.cancel()
         promptJob?.cancel()
+        lifetimeJob?.cancel()
         val connection = activeConnection
         activeConnection = null
+        val oldWorker = worker
+        val sid = activeOffer?.sessionId?.copyOf()
+
         cleanupJob = scope.launch(NonCancellable) {
-            runCatching { connection?.close() }
+            try {
+                runCatching { connection?.cancelAndClose(reason) }
+                linksClosed.complete(Unit)
+                oldWorker?.cancelAndJoin()
+                lifetimeJob?.join()
+                // Snapshot after the worker stops mutating sink/manifest bookkeeping.
+                sinks.forEach { (id, sink) ->
+                    if (id !in committedFiles) runCatching { sink.discard() }
+                    runCatching { sink.close() }
+                }
+                if (sid != null) sessionManifest?.files?.forEach { file ->
+                    runCatching { resumeStore.clear(sid, file.id) }
+                }
+            } finally {
+                linksClosed.complete(Unit)
+                runCatching { onCleanup?.invoke() }
+            }
         }
-        onCleanup?.invoke()
     }
 }

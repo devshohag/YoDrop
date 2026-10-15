@@ -58,13 +58,13 @@
   - State file is deleted once file integrity is verified and committed.
 
 ## [T7] Parallel TCP Pipelining, NACK, & Keep-Alive Handlers
-- **Decision**: Multi-socket parallel streams (2–4 connections) per transfer session.
+- Sender accepts multiple sockets; real parallel receiver scheduling remains Step 9 work.
 - **Wire Control Additions**:
   - `ACK (0x05)`: Explicit chunk delivery confirmation.
   - `NACK (0x06)`: Signals damaged or missing chunk indices, triggering immediate priority retransmission.
   - `PING/PONG (0x0A)` with a reply marker: Senders automatically echo PING with PONG to maintain active socket liveness.
-- **Synchronization**:
-  - A single `ChunkBitmap` protected by concurrency primitives coordinates parallel TCP worker routines without chunk collision or duplicate downloads.
+- Sender completion IDs are shared across reconnects. Receiver currently has one worker;
+  shared parallel bitmap scheduling remains Step 9 work.
 
 ## [T8] Strict Session Timeouts & Terminal State Resource Cleanup
 - **Decision**: Active timeout timers for each protocol transition and deterministic cleanup hooks.
@@ -75,7 +75,8 @@
   - `SOCKET_IDLE_TIMEOUT`: 15 seconds.
   - `PING_INTERVAL`: 5 seconds.
 - **Cleanup Policy**:
-  - Every transition to `Failed`, `Cancelled`, or `Done` invokes `cleanup()`, closing all sockets, cancelling background jobs, and stopping transports.
+  - Terminal failures, cancel and done invoke cleanup. Connection loss publishes
+    `Failed(canResume = true)` and retains session resources until reconnect or expiry.
 
 
 ## [Step 2] Remove JVM-only dependencies from commonMain
@@ -139,7 +140,6 @@
 - Worker state updates cannot overwrite terminal states.
 - Terminal sessions need explicit reset; reset waits for old workers/cleanup.
 - AUTH tests use real handshakes; resume fixtures use the advertised session ID.
-- Global timeout configuration remains for Step 6.
 - API 29 crypto execution remains pending from Step 3.
 
 ## [Step 6 / A3] Injected timeout configuration
@@ -155,5 +155,33 @@
 - Read watchdog closes connections to unblock blocking platform socket reads.
 - Platform socket close no longer flushes before closing; writeFrame flushes.
 - Timeout tests use runTest/virtual time with real state machines.
-- Periodic PING, verification-time liveness and resumable connection loss
-  remain Step 7 work; API 29 crypto verification remains pending.
+- Step 7 adds periodic PING, verification-time liveness and resumable connection loss.
+  API 29 crypto verification remains pending.
+
+## [Step 7] Connection lifecycle, liveness and terminal cleanup
+- Both state machines wrap each socket with SessionConnection: one reader and a
+  separate 5-second PING coroutine; writes are serialized so frames cannot interleave.
+- PING/PONG are consumed independently of chunk IO and final SHA-256 verification.
+  Any inbound frame resets the 15-second read deadline. Replies are not echoed.
+- EOF, transport IO errors and idle timeout close the connection and publish
+  Failed(canResume = true) when no usable sender sockets remain / receiver disconnects.
+  Keys, sender sources, receiver sinks, bitmaps and attempt counter remain valid.
+- Reattachment uses the existing LINKING window (20 seconds by default). Each
+  new connection re-AUTHs and resends the manifest; changed metadata is rejected.
+  No total deadline is imposed on an actively progressing large transfer.
+- Reconnect expiry, cancel, deny, authentication/protocol/checksum failure and
+  scope cancellation are terminal. Terminal Failed has canResume = false.
+- Failed(canResume = true) permits ATTACH/CANCEL; terminal states require reset.
+- Completed file IDs survive reconnect, preventing duplicate completion counting
+  and preventing already committed files from being recreated during reattachment.
+- Terminal cleanup is idempotent and runs with NonCancellable. It sends CANCEL
+  with a bounded best-effort reason before closing, cancels/joins workers, closes
+  sources and sinks, discards uncommitted partial files and clears resume state.
+  Peer CANCEL is consumed without echo; transport cleanup hook runs once.
+- A lifetime watcher handles owner-scope cancellation before a worker starts.
+  Closing the socket before joining unblocks pending blocking platform reads.
+- FileSink.discard is wired through Android's scoped-storage wrapper and both
+  disk implementations. It deletes .part data and retains committed destinations.
+- Step 8 still owns atomic/forced bitmap persistence, crash recovery validation
+  and the >=256 MiB real-TCP kill-at-40-percent acceptance test. Step 9 owns the
+  real parallel receiver; this step does not claim either acceptance criterion.

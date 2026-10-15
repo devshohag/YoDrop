@@ -233,6 +233,10 @@ class MainActivity : ComponentActivity() {
                 publishToMediaStore(baseSink.committedFile, meta.name, meta.mime)
             }
 
+            override suspend fun discard() {
+                baseSink.discard()
+            }
+
             override suspend fun close() {
                 baseSink.close()
             }

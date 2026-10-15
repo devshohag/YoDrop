@@ -38,12 +38,15 @@ internal suspend fun readFrameWithIdleTimeout(
         }
 
         if (expired.isCompleted) {
-            throw IllegalStateException(
+            throw ConnectionLostException(
                 "Socket idle timeout after ${timeoutMs}ms",
                 failure
             )
         }
-        throw failure
+        if (failure is CancellationException || failure is IllegalArgumentException) {
+            throw failure
+        }
+        throw ConnectionLostException("Socket read failed: ${failure.message}", failure)
     } finally {
         watchdog.cancel()
     }

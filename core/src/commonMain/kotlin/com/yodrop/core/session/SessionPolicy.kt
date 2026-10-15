@@ -9,12 +9,12 @@ internal object SessionPolicy {
     fun senderTerminal(state: SenderState): Boolean =
         state is SenderState.Done ||
         state is SenderState.Cancelled ||
-        state is SenderState.Failed
+        (state is SenderState.Failed && !state.canResume)
 
     fun receiverTerminal(state: ReceiverState): Boolean =
         state is ReceiverState.Done ||
         state is ReceiverState.Cancelled ||
-        state is ReceiverState.Failed
+        (state is ReceiverState.Failed && !state.canResume)
 
     fun sender(state: SenderState, event: SessionEvent): Boolean =
         when (event) {
@@ -24,7 +24,8 @@ internal object SessionPolicy {
             SessionEvent.ATTACH ->
                 state is SenderState.Linking ||
                 state is SenderState.Auth ||
-                state is SenderState.Transferring
+                state is SenderState.Transferring ||
+                (state is SenderState.Failed && state.canResume)
             SessionEvent.CANCEL ->
                 state !is SenderState.Idle && !senderTerminal(state)
             SessionEvent.RESET -> senderTerminal(state)
@@ -38,7 +39,8 @@ internal object SessionPolicy {
             SessionEvent.CLAIM -> state is ReceiverState.OfferSeen
             SessionEvent.ACCEPT, SessionEvent.DENY ->
                 state is ReceiverState.AcceptPrompt
-            SessionEvent.ATTACH -> state is ReceiverState.Linking
+            SessionEvent.ATTACH -> state is ReceiverState.Linking ||
+                (state is ReceiverState.Failed && state.canResume)
             SessionEvent.CANCEL ->
                 state !is ReceiverState.Idle && !receiverTerminal(state)
             SessionEvent.RESET -> receiverTerminal(state)

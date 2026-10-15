@@ -16,6 +16,8 @@ interface FileSink {
     suspend fun writeChunk(offset: Long, data: ByteArray)
     suspend fun verifySha256(expectedSha256: ByteArray): Boolean
     suspend fun commit(): Unit
+    /** Discard uncommitted partial data on a terminal session. */
+    suspend fun discard() { close() }
     suspend fun close()
 }
 
@@ -78,6 +80,13 @@ class MemoryFileSink(
             CryptoEngine.sha256(snapshot),
             expectedSha256
         )
+    }
+
+    override suspend fun discard() {
+        mutex.withLock {
+            buffer = ByteArray(0)
+            writtenSize = 0
+        }
     }
 
     override suspend fun commit() {}

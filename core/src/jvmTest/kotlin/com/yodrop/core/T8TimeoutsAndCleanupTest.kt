@@ -21,7 +21,8 @@ class T8TimeoutsAndCleanupTest {
         claimWindowMs = 100_000,
         acceptPromptMs = 100_000,
         linkingMs = 100_000,
-        socketIdleMs = 100_000
+        socketIdleMs = 100_000,
+        pingIntervalMs = 100_000
     )
 
     private class Counts {
@@ -193,7 +194,8 @@ class T8TimeoutsAndCleanupTest {
         val failed = assertIs<SenderState.Failed>(f.sender.state.value)
         assertTrue(failed.error.contains("Socket idle timeout"))
         assertTrue(senderWire.isClosed)
-        assertEquals(1, f.counts.sender)
+        assertTrue(failed.canResume)
+        assertEquals(0, f.counts.sender)
     }
 
     @Test
@@ -211,7 +213,8 @@ class T8TimeoutsAndCleanupTest {
         val failed = assertIs<ReceiverState.Failed>(f.receiver.state.value)
         assertTrue(failed.error.contains("Socket idle timeout"))
         assertTrue(receiverWire.isClosed)
-        assertEquals(1, f.counts.receiver)
+        assertTrue(failed.canResume)
+        assertEquals(0, f.counts.receiver)
     }
 
     @Test

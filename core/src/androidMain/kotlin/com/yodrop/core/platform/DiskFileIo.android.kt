@@ -102,6 +102,12 @@ class DiskFileSink(
         Unit
     }
 
+    override suspend fun discard() = withContext(Dispatchers.IO) {
+        close()
+        check(!partFile.exists() || partFile.delete()) { "Cannot delete partial file" }
+        Unit
+    }
+
     override suspend fun close() = withContext(Dispatchers.IO) {
         runCatching { raf.close() }
         Unit
