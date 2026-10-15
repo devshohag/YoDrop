@@ -49,3 +49,10 @@
   - `FileSource`: Random-access streaming abstraction reading exact `[offset, len)` slices from disk via `RandomAccessFile`/`FileChannel`.
   - `FileSink`: Random-access streaming sink writing chunks directly into temporary `.part` files on disk, calculating incremental or sequential post-transfer SHA-256 without loading files into RAM.
   - On verification success, atomic rename from `.part` to final destination file.
+
+## [T6] Persistent Resume Store & Partial Transfer Recovery
+- **Decision**: Chunk progress is persisted to disk using `ResumeStore`.
+- **Mechanism**:
+  - Bitmap state is stored per `{sessionId, fileId}`.
+  - Upon reconnection, receiver loads the existing bitmap and requests only unreceived chunks.
+  - State file is deleted once file integrity is verified and committed.

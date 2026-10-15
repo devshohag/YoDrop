@@ -8,6 +8,8 @@ import com.yodrop.core.platform.FileSink
 import com.yodrop.core.protocol.*
 import com.yodrop.core.transfer.ChunkBitmap
 import com.yodrop.core.transfer.ChunkPlanner
+import com.yodrop.core.transfer.InMemoryResumeStore
+import com.yodrop.core.transfer.ResumeStore
 import com.yodrop.core.transport.Connection
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,6 +19,7 @@ import java.security.MessageDigest
 
 class ReceiverStateMachine(
     private val scope: CoroutineScope,
+    private val resumeStore: ResumeStore = InMemoryResumeStore(),
     private val sinkFactory: (FileMeta) -> FileSink = { meta ->
         throw NotImplementedError("sinkFactory must be provided for receiving files")
     }
@@ -134,7 +137,9 @@ class ReceiverStateMachine(
 
         for ((fileIdx, file) in manifest.files.withIndex()) {
             val totalChunks = ChunkPlanner.calculateTotalChunks(file.size, manifest.chunkSize)
-            val bitmap = ChunkBitmap(totalChunks)
+            
+            // T6: Load persisted resume bitmap if transfer is recovering
+            val bitmap = resumeStore.loadBitmap(sid, file.id, totalChunks)
             val sink = sinkFactory(file)
 
             try {
@@ -173,6 +178,9 @@ class ReceiverStateMachine(
                         sink.writeChunk(start, plaintext)
                         bitmap.markReceived(chunkIdx)
 
+                        // T6: Save progress to ResumeStore
+                        resumeStore.saveBitmap(sid, file.id, bitmap)
+
                         val fileProgress = (fileIdx + (chunkIdx + 1).toFloat() / totalChunks.toFloat()) / manifest.files.size.toFloat()
                         _state.value = ReceiverState.Receiving(fileProgress, file.name)
                     }
@@ -186,6 +194,7 @@ class ReceiverStateMachine(
                     throw IllegalStateException("Checksum mismatch for file ${file.name}")
                 }
                 sink.commit()
+                resumeStore.clear(sid, file.id)
             } finally {
                 sink.close()
             }
