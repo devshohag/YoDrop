@@ -44,6 +44,7 @@ class SenderStateMachine(
     private var fileSourceMap: Map<String, FileSource> = emptyMap()
     private val activeConnections = mutableListOf<SessionConnection>()
     private val connectionsMutex = Mutex()
+    private val authenticated = mutableSetOf<SessionConnection>()
     private val attemptMutex = Mutex()
     private var attemptCounter = 0
     private val workers = mutableListOf<Job>()
@@ -207,7 +208,8 @@ class SenderStateMachine(
     suspend fun attachConnection(connection: Connection): Boolean =
         eventMutex.withLock {
             if (!scope.isActive ||
-                !SessionPolicy.sender(_state.value, SessionEvent.ATTACH)) {
+                !SessionPolicy.sender(_state.value, SessionEvent.ATTACH) ||
+                connectionsMutex.withLock { activeConnections.size >= 4 }) {
                 withContext(NonCancellable) {
                     runCatching { connection.close() }
                 }
@@ -216,7 +218,7 @@ class SenderStateMachine(
 
             linkingTimeoutJob?.cancel()
             reconnectJob?.cancel()
-            val wire = SessionConnection(connection, timeouts)
+            val wire = SessionConnection(connection, timeouts, consumeAcks = true)
             connectionsMutex.withLock {
                 activeConnections.add(wire)
             }
@@ -240,14 +242,14 @@ class SenderStateMachine(
                 } finally {
                     withContext(NonCancellable) {
                         runCatching { wire.close() }
-                        connectionsMutex.withLock { activeConnections.remove(wire) }
+                        connectionsMutex.withLock { activeConnections.remove(wire); authenticated.remove(wire) }
                     }
                 }
             }
             workers.add(job)
             true
         }
-    private suspend fun runTransferWorker(connection: Connection) {
+    private suspend fun runTransferWorker(connection: SessionConnection) {
         val keys = sessionKeys ?: throw IllegalStateException("No session keys derived")
         val sid = sessionId ?: throw IllegalStateException("No sessionId initialized")
 
@@ -275,6 +277,7 @@ class SenderStateMachine(
             return
         }
 
+        connectionsMutex.withLock { authenticated.add(connection) }
         val manifest = ManifestMessage(files = filesToSend)
         manifest.validate()
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.MANIFEST, manifest))
@@ -302,16 +305,28 @@ class SenderStateMachine(
                         "Unknown FILE_DONE file id"
                     }
                     if (doneMsg.ok) {
-                        val count = eventMutex.withLock {
+                        val complete = eventMutex.withLock {
+                            if (SessionPolicy.senderTerminal(_state.value)) return@withLock false
                             completedFiles.add(doneMsg.fileId)
-                            completedFiles.size
+                            val count = completedFiles.size
+                            if (count == filesToSend.size) {
+                                publishLocked(SenderState.Done)
+                                true
+                            } else {
+                                publishLocked(SenderState.Transferring(
+                                    count.toFloat() / filesToSend.size, doneMsg.fileId))
+                                false
+                            }
                         }
-                        val progress = count.toFloat() / filesToSend.size.toFloat()
-                        if (!setState(SenderState.Transferring(progress, doneMsg.fileId))) return
-                        if (count == filesToSend.size) {
-                            connection.writeFrame(RawFrame(FrameType.DONE, ByteArray(0)))
-                            if (!setState(SenderState.Done)) return
-                            eventMutex.withLock { cleanup() }
+                        if (complete) {
+                            // Keep delivery alive even if one completed socket closes early.
+                            withContext(NonCancellable) {
+                                val peers = connectionsMutex.withLock { authenticated.toList() }
+                                coroutineScope {
+                                    peers.map { peer -> launch { runCatching { peer.completeAndClose() } } }.joinAll()
+                                }
+                                eventMutex.withLock { cleanup() }
+                            }
                             return
                         }
                     } else {
@@ -319,11 +334,7 @@ class SenderStateMachine(
                         return
                     }
                 }
-                FrameType.DONE -> {
-                    if (!setState(SenderState.Done)) return
-                    eventMutex.withLock { cleanup() }
-                    return
-                }
+                FrameType.DONE -> throw IllegalArgumentException("Unexpected receiver DONE")
                 else -> throw IllegalArgumentException("Unexpected sender frame ${frame.type}")
             }
         }
@@ -406,7 +417,7 @@ class SenderStateMachine(
 
     private suspend fun connectionLost(wire: SessionConnection, failure: Throwable) {
         eventMutex.withLock {
-            connectionsMutex.withLock { activeConnections.remove(wire) }
+            connectionsMutex.withLock { activeConnections.remove(wire); authenticated.remove(wire) }
             if (cleanupStarted || SessionPolicy.senderTerminal(_state.value)) return@withLock
             if (connectionsMutex.withLock { activeConnections.isNotEmpty() }) return@withLock
             publishLocked(SenderState.Failed(failure.message ?: "Connection lost", canResume = true))
@@ -431,7 +442,7 @@ class SenderStateMachine(
             workers.toList() to cleanupJob
         }
         pending.first.forEach { it.cancelAndJoin() }
-        pending.second?.join()
+        eventMutex.withLock { cleanupJob }?.join()
 
         return eventMutex.withLock {
             if (!SessionPolicy.sender(_state.value, SessionEvent.RESET)) {
@@ -449,6 +460,7 @@ class SenderStateMachine(
             lifetimeJob = null
             reconnectJob = null
             completedFiles.clear()
+            connectionsMutex.withLock { authenticated.clear() }
             publishLocked(SenderState.Idle)
             true
         }

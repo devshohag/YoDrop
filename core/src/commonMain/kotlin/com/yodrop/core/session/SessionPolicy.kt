@@ -40,6 +40,8 @@ internal object SessionPolicy {
             SessionEvent.ACCEPT, SessionEvent.DENY ->
                 state is ReceiverState.AcceptPrompt
             SessionEvent.ATTACH -> state is ReceiverState.Linking ||
+                state is ReceiverState.Auth || state is ReceiverState.Receiving ||
+                state is ReceiverState.Verifying ||
                 (state is ReceiverState.Failed && state.canResume)
             SessionEvent.CANCEL ->
                 state !is ReceiverState.Idle && !receiverTerminal(state)

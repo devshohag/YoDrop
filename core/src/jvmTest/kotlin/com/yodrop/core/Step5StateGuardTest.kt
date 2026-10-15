@@ -73,9 +73,9 @@ class Step5StateGuardTest {
             setOf(SessionEvent.CANCEL),
             setOf(SessionEvent.ACCEPT, SessionEvent.DENY, SessionEvent.CANCEL),
             setOf(SessionEvent.ATTACH, SessionEvent.CANCEL),
-            setOf(SessionEvent.CANCEL),
-            setOf(SessionEvent.CANCEL),
-            setOf(SessionEvent.CANCEL),
+            setOf(SessionEvent.ATTACH, SessionEvent.CANCEL),
+            setOf(SessionEvent.ATTACH, SessionEvent.CANCEL),
+            setOf(SessionEvent.ATTACH, SessionEvent.CANCEL),
             setOf(SessionEvent.RESET),
             setOf(SessionEvent.RESET),
             setOf(SessionEvent.RESET)

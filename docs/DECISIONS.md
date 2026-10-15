@@ -58,13 +58,13 @@
   - State file is deleted once file integrity is verified and committed.
 
 ## [T7] Parallel TCP Pipelining, NACK, & Keep-Alive Handlers
-- Sender accepts multiple sockets; real parallel receiver scheduling remains Step 9 work.
+- Sender and receiver accept multiple sockets; Step 9 implements real parallel scheduling.
 - **Wire Control Additions**:
   - `ACK (0x05)`: Explicit chunk delivery confirmation.
   - `NACK (0x06)`: Signals damaged or missing chunk indices, triggering immediate priority retransmission.
   - `PING/PONG (0x0A)` with a reply marker: Senders automatically echo PING with PONG to maintain active socket liveness.
-- Sender completion IDs are shared across reconnects. Receiver currently has one worker;
-  shared parallel bitmap scheduling remains Step 9 work.
+- Sender completion IDs are shared across reconnects. Step 9 adds real receiver
+  workers with shared bitmap/lease scheduling.
 
 ## [T8] Strict Session Timeouts & Terminal State Resource Cleanup
 - **Decision**: Active timeout timers for each protocol transition and deterministic cleanup hooks.
@@ -216,7 +216,7 @@
 - Separate real-TCP crash fixtures seed received bits with truncated/missing
   .part files, verify both chunks are requested again, and compare final SHA-256.
 - This restores a live session after connection loss; process-restart restoration
-  of session keys/user consent is not implemented. Real parallel receiver remains
+  of session keys/user consent is not implemented. Real parallel receiver is implemented in
   Step 9; the 1 GiB / 256 MiB heap acceptance test remains Step 10.
 
 
@@ -233,3 +233,48 @@
   Both valid snapshots are nonempty so a missing-record fallback cannot pass.
   No retry, sleep, ignored IO failure or non-atomic write fallback was introduced.
 - This process-local gate does not coordinate independent external writer processes.
+
+## [Step 9] Real parallel receiver and session completion
+- Receiver accepts up to four authenticated connections (one-connection use stays
+  supported). Each socket runs a real receive worker; there is one shared
+  ReceiveCoordinator for the accepted session and one ChunkBitmap/sink per file.
+- The coordinator's Mutex guards chunk leases, received bits, retry counts,
+  byte-based progress and verification ownership. A chunk belongs to only one
+  socket at a time; failed workers release leases for healthy sockets to acquire.
+- Each connection has a bounded sliding request window (default 4; configurable
+  1..16). A received chunk immediately frees a slot, without waiting for the rest
+  of a batch. Idle workers wait on a shared version signal or socket input using
+  channel select, without polling or dropping frames during waiter cancellation.
+- Every socket re-AUTHs and validates the same manifest. More sockets may attach
+  during AUTH/RECEIVING/VERIFYING. A fifth connection is rejected and closed on
+  both machines. Event-policy matrix tests cover the newly allowed attachments.
+- AES-GCM decryption failures send NACK with CHUNK_AUTHENTICATION_FAILED while
+  retaining the chunk lease. Sender retransmits using its session-wide monotonic
+  attempt counter (and hence a fresh chunk nonce). After three failures for a
+  chunk on one worker, that socket is closed and its work is reassigned. Healthy
+  sockets can finish without turning the session into Failed.
+- Header/request bounds errors, invalid AUTH, manifest mismatch, checksum failure
+  and peer cancellation remain terminal. Normal connection loss still retains
+  resume data and starts the Step 7 reconnect deadline only if no sockets remain.
+- Verification is claimed once per file, performed outside the coordinator lock,
+  and committed bookkeeping is protected from cancellation. PING/PONG continues
+  on each socket during verification. Received bytes are forced before bitmap
+  publication, retaining the Step 8 persistence ordering.
+- Verified file IDs are reported on surviving sockets so a lost notification
+  does not strand completion. Sender deduplicates FILE_DONE IDs session-wide,
+  transitions to Done once after all IDs are verified, broadcasts bounded DONE
+  messages to authenticated peers, then cleans up. Premature receiver DONE is
+  rejected. Receiver also transitions/cleans up once after all files are committed.
+- Sender ACK traffic is consumed by its socket reader so ACKs cannot block its
+  PING/EOF processing while a chunk write is in progress.
+- Cleanup and reset wait for every worker, release leases and close shared sinks
+  once the workers stop. Completed sinks are retained until terminal cleanup.
+- T7PipeliningAndStreamsTest no longer contains a hand-written receiver. It uses
+  both real machines with four real TCP sockets for two disk files totaling
+  48 MiB, injects corrupted ciphertext, proves fresh retry attempts, verifies
+  both final SHA-256 values and asserts one Done transition on each side.
+- Separate tests exhaust one worker's retry budget while the other three finish,
+  prove sliding-window refill before a held chunk arrives, and reject a fifth
+  connection. The existing 256 MiB real TCP disconnect/reconnect test still passes.
+- Real Android transport wiring remains later remediation work. Step 10's
+  1 GiB / 256 MiB heap acceptance criterion is not claimed here.

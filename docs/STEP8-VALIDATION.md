@@ -68,3 +68,18 @@ bounded NIO channel. The concurrency test now calls that production loader from
 an independent store instance and retains its exact old/new bytes assertion; both
 valid snapshots have received bits, so a missing-record empty result fails.
 A new Windows dual-build result is still required after applying the correction.
+
+
+## Owner verification after the Windows correction
+
+The owner ran the complete clean JVM-test + Android-assemble command on Windows.
+All 97 JVM tests passed, including the concurrent production-loader test and the
+256 MiB real TCP recovery test. Output:
+
+```text
+BUILD SUCCESSFUL in 56s
+61 actionable tasks: 61 executed
+```
+
+This resolves the Step 8 dual-build pending item above. Step 8 was pushed as
+c25a292 before Step 9 began.

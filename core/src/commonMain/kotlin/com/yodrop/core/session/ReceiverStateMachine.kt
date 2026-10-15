@@ -15,6 +15,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.channels.BufferOverflow
@@ -28,7 +29,9 @@ class ReceiverStateMachine(
     private val sinkFactory: (FileMeta) -> FileSink = { meta ->
         throw NotImplementedError("sinkFactory must be provided for receiving files")
     },
-    private val timeouts: Timeouts = Timeouts()
+    private val timeouts: Timeouts = Timeouts(),
+    private val maxConnections: Int = 4,
+    private val requestWindow: Int = 4
 ) {
     private val _state = MutableStateFlow<ReceiverState>(ReceiverState.Idle)
     val state: StateFlow<ReceiverState> = _state.asStateFlow()
@@ -41,23 +44,23 @@ class ReceiverStateMachine(
     val transitions = _transitions.asSharedFlow()
 
     init {
+        require(maxConnections in 1..4) { "Connection count must be 1..4" }
+        require(requestWindow in 1..16) { "Request window must be 1..16" }
         _transitions.tryEmit(ReceiverState.Idle)
     }
 
     private var myKeyPair: KeyPair? = null
     private var sessionKeys: SessionKeys? = null
     private var activeOffer: OfferMessage? = null
-    private var activeConnection: SessionConnection? = null
-    private var worker: Job? = null
+    private val activeConnections = mutableSetOf<SessionConnection>()
+    private val workers = mutableListOf<Job>()
+    private var transfer: ReceiveCoordinator? = null
     private var promptJob: Job? = null
     private var cleanupJob: Job? = null
     private var linksClosed = CompletableDeferred<Unit>()
     private var cleanupStarted = false
     private var lifetimeJob: Job? = null
     private var reconnectJob: Job? = null
-    private val sinks = mutableMapOf<String, FileSink>()
-    private val committedFiles = mutableSetOf<String>()
-    private var sessionManifest: ManifestMessage? = null
     private var claimWindowJob: Job? = null
     private var acceptTimeoutJob: Job? = null
     private var linkingTimeoutJob: Job? = null
@@ -112,8 +115,10 @@ class ReceiverStateMachine(
                     current is ReceiverState.Verifying
                 is ReceiverState.Verifying ->
                     current is ReceiverState.Auth ||
+                    current is ReceiverState.Receiving ||
+                    current is ReceiverState.Verifying
+                ReceiverState.Done -> current is ReceiverState.Verifying ||
                     current is ReceiverState.Receiving
-                ReceiverState.Done -> current is ReceiverState.Verifying
                 else -> false
             }
             if (!allowed) return@withLock false
@@ -198,6 +203,7 @@ class ReceiverStateMachine(
             }
             val offer = checkNotNull(activeOffer)
             acceptTimeoutJob?.cancel()
+            transfer = ReceiveCoordinator(offer.sessionId.copyOf(), resumeStore, sinkFactory)
             publishLocked(ReceiverState.Linking(linkInfo))
             linkingTimeoutJob = startTimer(
                 timeouts.linkingMs,
@@ -221,7 +227,8 @@ class ReceiverStateMachine(
     suspend fun attachConnection(connection: Connection): Boolean =
         eventMutex.withLock {
             if (!scope.isActive ||
-                !SessionPolicy.receiver(_state.value, SessionEvent.ATTACH)) {
+                !SessionPolicy.receiver(_state.value, SessionEvent.ATTACH) ||
+                activeConnections.size >= maxConnections) {
                 withContext(NonCancellable) {
                     runCatching { connection.close() }
                 }
@@ -231,9 +238,11 @@ class ReceiverStateMachine(
             linkingTimeoutJob?.cancel()
             reconnectJob?.cancel()
             val wire = SessionConnection(connection, timeouts)
-            activeConnection = wire
-            publishLocked(ReceiverState.Auth)
-            worker = scope.launch {
+            activeConnections.add(wire)
+            if (_state.value is ReceiverState.Linking || _state.value is ReceiverState.Failed) {
+                publishLocked(ReceiverState.Auth)
+            }
+            val job = scope.launch {
                 try {
                     wire.run { runReceiveLoop(it) }
                 } catch (e: CancellationException) {
@@ -248,15 +257,15 @@ class ReceiverStateMachine(
                 } finally {
                     withContext(NonCancellable) {
                         runCatching { wire.close() }
-                        eventMutex.withLock {
-                            if (activeConnection === wire) activeConnection = null
-                        }
+                        transfer?.release(wire)
+                        eventMutex.withLock { activeConnections.remove(wire) }
                     }
                 }
             }
+            workers.add(job)
             true
         }
-    private suspend fun runReceiveLoop(connection: Connection) {
+    private suspend fun runReceiveLoop(connection: SessionConnection) {
         val keys = sessionKeys ?: throw IllegalStateException("No session keys")
         val offer = activeOffer ?: throw IllegalStateException("No active offer")
         val sid = offer.sessionId
@@ -289,155 +298,65 @@ class ReceiverStateMachine(
         require(manifestFrame.type == FrameType.MANIFEST) { "Expected MANIFEST frame" }
         val manifest = ProtocolCodec.decodePayload<ManifestMessage>(manifestFrame)
         
-        manifest.validate()
-        val previous = sessionManifest
-        require(previous == null || sameManifest(previous, manifest)) {
-            "Manifest changed on reconnect"
-        }
-        sessionManifest = manifest
-
-        for ((fileIdx, file) in manifest.files.withIndex()) {
-            val totalChunks = ChunkPlanner.calculateTotalChunks(file.size, manifest.chunkSize)
-            var bitmap = resumeStore.loadBitmap(sid, file.id, totalChunks)
-            if (!setState(ReceiverState.Receiving(
-                    fileIdx.toFloat() / manifest.files.size, file.name
-                ))) return
-            if (file.id in committedFiles) {
+        val shared = checkNotNull(transfer)
+        shared.prepare(manifest)
+        if (!setState(ReceiverState.Receiving(0f, manifest.files.first().name))) return
+        val reported = mutableSetOf<String>()
+        while (currentCoroutineContext().isActive) {
+            val observed = shared.version.value
+            val work = shared.schedule(connection, requestWindow)
+            for (id in work.committed) if (reported.add(id)) {
                 connection.writeFrame(ProtocolCodec.encodeToFrame(
-                    FrameType.FILE_DONE, FileDoneMessage(file.id, true)
-                ))
+                    FrameType.FILE_DONE, FileDoneMessage(id, true)))
+            }
+            if (work.verify != null) {
+                if (!setState(ReceiverState.Verifying(work.verify.meta.id))) return
+                try {
+                    shared.verify(work.verify)
+                } catch (e: ReceiveCoordinator.ChecksumMismatch) {
+                    try {
+                        connection.writeFrame(ProtocolCodec.encodeToFrame(
+                            FrameType.FILE_DONE, FileDoneMessage(e.fileId, false)))
+                    } finally {
+                        withContext(NonCancellable) { fail(checkNotNull(e.message)) }
+                    }
+                    return
+                }
                 continue
             }
-            val sink = sinks.getOrPut(file.id) { sinkFactory(file) }
-            var requiredLength = 0L
-            for (index in 0 until totalChunks) {
-                if (bitmap.isReceived(index)) requiredLength =
-                    ChunkPlanner.getChunkByteRange(index, file.size, manifest.chunkSize).second
+            for (request in work.requests) {
+                connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CHUNK_REQ, request))
             }
-            if (!sink.hasDataThrough(requiredLength)) {
-                bitmap = ChunkBitmap(totalChunks)
-                resumeStore.clear(sid, file.id)
-            }
-
-            while (!bitmap.isComplete()) {
-                val missing = bitmap.getMissingChunks(batchSize = 16)
-                if (missing.isEmpty()) break
-
-                val reqMsg = ChunkReqMessage(fileId = file.id, chunkIndices = missing)
-                connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CHUNK_REQ, reqMsg))
-
-                val pending = missing.toMutableSet()
-                repeat(missing.size) {
-                    val dataFrame = readProtocolFrame(connection)
-                    require(dataFrame.type == FrameType.CHUNK_DATA) { "Expected CHUNK_DATA frame" }
-
-                    val payload = dataFrame.payload
-                    require(payload.size >= 26) { "Truncated chunk header" }
-                    val idLen = payload[0].toInt() and 0xFF
-                    require(idLen in 1..128 &&
-                        payload.size >= 1 + idLen + 8 + 16) {
-                        "Invalid chunk header"
-                    }
-                    val fileId = payload.decodeToString(
-                        1, 1 + idLen, throwOnInvalidSequence = true
-                    )
-                    require(fileId == file.id) { "Wrong chunk file id" }
-                    var off = 1 + idLen
-                    val chunkIdx = ((payload[off].toInt() and 0xFF) shl 24) or
-                            ((payload[off + 1].toInt() and 0xFF) shl 16) or
-                            ((payload[off + 2].toInt() and 0xFF) shl 8) or
-                            (payload[off + 3].toInt() and 0xFF)
-                    off += 4
-                    val attemptCounter = ((payload[off].toInt() and 0xFF) shl 24) or
-                            ((payload[off + 1].toInt() and 0xFF) shl 16) or
-                            ((payload[off + 2].toInt() and 0xFF) shl 8) or
-                            (payload[off + 3].toInt() and 0xFF)
-                    off += 4
-                    require(pending.remove(chunkIdx)) {
-                        "Unrequested or duplicate chunk index"
-                    }
-                    require(attemptCounter >= 0) {
-                        "Invalid attempt counter"
-                    }
-                    val (chunkStart, chunkEnd) =
-                        ChunkPlanner.getChunkByteRange(
-                            chunkIdx, file.size, manifest.chunkSize
-                        )
-                    val expectedLength = (chunkEnd - chunkStart).toInt()
-                    require(payload.size - off == expectedLength + 16) {
-                        "Wrong encrypted chunk length"
-                    }
-                    val ciphertext = payload.copyOfRange(off, payload.size)
-
-                    val nonce = NonceUtils.buildChunkNonce(keys.nonceBase, chunkIdx, attemptCounter)
-                    val aad = NonceUtils.buildAad(sid, fileId, chunkIdx)
-                    val plaintext = CryptoEngine.decryptAesGcm(keys.senderToReceiverKey, nonce, ciphertext, aad)
-
-                    require(plaintext.size == expectedLength) {
-                        "Wrong plaintext chunk length"
-                    }
-                    val start = chunkStart
-                    sink.writeChunk(start, plaintext)
-                    sink.force()
-                    bitmap.markReceived(chunkIdx)
-                    resumeStore.saveBitmap(sid, file.id, bitmap)
-
-                    val fileProgress = (fileIdx + (chunkIdx + 1).toFloat() / totalChunks.toFloat()) / manifest.files.size.toFloat()
-                    if (!setState(ReceiverState.Receiving(fileProgress, file.name))) return
+            val frame = coroutineScope {
+                val changed = async(start = CoroutineStart.UNDISPATCHED) {
+                    shared.version.first { it != observed }
                 }
-            }
-
-            if (!setState(ReceiverState.Verifying(file.id))) return
-            val matches = sink.verifySha256(file.sha256)
-
-            if (!matches) {
-                // Never retain a corrupt bitmap/part, even if notifying the peer fails.
-                withContext(NonCancellable) {
-                    sink.discard()
-                    sink.close()
-                    sinks.remove(file.id)
-                    resumeStore.clear(sid, file.id)
+                try { connection.readFrameOrSignal(changed) }
+                finally { changed.cancel() }
+            } ?: continue
+            when (frame.type) {
+                FrameType.CHUNK_DATA -> {
+                    val delivery = shared.receive(connection, frame, keys) ?: continue
+                    if (!setState(ReceiverState.Receiving(delivery.progress, delivery.name))) return
+                    connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.ACK,
+                        AckMessage(delivery.fileId, delivery.index)))
                 }
-                try {
-                    connection.writeFrame(ProtocolCodec.encodeToFrame(
-                        FrameType.FILE_DONE, FileDoneMessage(file.id, false)
-                    ))
-                } finally {
-                    withContext(NonCancellable) {
-                        fail("Checksum mismatch for file ${file.name}")
+                FrameType.DONE -> {
+                    require(shared.allCommitted()) { "DONE received before all files were verified" }
+                    eventMutex.withLock {
+                        if (!SessionPolicy.receiverTerminal(_state.value)) {
+                            publishLocked(ReceiverState.Done)
+                            cleanup()
+                        }
                     }
+                    return
                 }
-                return
+                else -> throw IllegalArgumentException("Unexpected receiver frame ${frame.type}")
             }
-            sink.commit()
-            committedFiles.add(file.id)
-            sink.close()
-            resumeStore.clear(sid, file.id)
-            connection.writeFrame(
-                ProtocolCodec.encodeToFrame(
-                    FrameType.FILE_DONE, FileDoneMessage(file.id, true)
-                )
-            )
         }
-
-        if (_state.value !is ReceiverState.Verifying) {
-            if (!setState(ReceiverState.Verifying(manifest.files.last().id))) return
-        }
-        val doneFrame = readProtocolFrame(connection)
-        require(doneFrame.type == FrameType.DONE) { "Expected DONE frame" }
-        if (!setState(ReceiverState.Done)) return
-        eventMutex.withLock { cleanup() }
     }
 
-    private suspend fun readProtocolFrame(connection: Connection): RawFrame =
-        connection.readFrame()
-
-    private fun sameManifest(a: ManifestMessage, b: ManifestMessage): Boolean =
-        a.chunkSize == b.chunkSize && a.files.size == b.files.size &&
-        a.files.zip(b.files).all { (x, y) ->
-            x.id == y.id && x.name == y.name && x.size == y.size &&
-                x.mime == y.mime && x.sha256.contentEquals(y.sha256)
-        }
+    private suspend fun readProtocolFrame(connection: Connection): RawFrame = connection.readFrame()
 
     private suspend fun fail(reason: String) {
         eventMutex.withLock {
@@ -461,9 +380,10 @@ class ReceiverStateMachine(
 
     private suspend fun connectionLost(wire: SessionConnection, failure: Throwable) {
         eventMutex.withLock {
-            if (activeConnection !== wire || cleanupStarted ||
-                SessionPolicy.receiverTerminal(_state.value)) return@withLock
-            activeConnection = null
+            transfer?.release(wire)
+            activeConnections.remove(wire)
+            if (cleanupStarted || SessionPolicy.receiverTerminal(_state.value) ||
+                activeConnections.isNotEmpty()) return@withLock
             publishLocked(ReceiverState.Failed(failure.message ?: "Connection lost", canResume = true))
             reconnectJob?.cancel()
             reconnectJob = startTimer(timeouts.linkingMs, "Reconnect deadline expired") {
@@ -477,9 +397,9 @@ class ReceiverStateMachine(
             if (!SessionPolicy.receiver(_state.value, SessionEvent.RESET)) {
                 return false
             }
-            Triple(worker, promptJob, cleanupJob)
+            Triple(workers.toList(), promptJob, cleanupJob)
         }
-        pending.first?.cancelAndJoin()
+        pending.first.forEach { it.cancelAndJoin() }
         pending.second?.cancelAndJoin()
         pending.third?.join()
 
@@ -487,10 +407,10 @@ class ReceiverStateMachine(
             if (!SessionPolicy.receiver(_state.value, SessionEvent.RESET)) {
                 return@withLock false
             }
-            worker = null
+            workers.clear()
             promptJob = null
             cleanupJob = null
-            activeConnection = null
+            activeConnections.clear()
             activeOffer = null
             sessionKeys = null
             myKeyPair = null
@@ -498,9 +418,7 @@ class ReceiverStateMachine(
             cleanupStarted = false
             lifetimeJob = null
             reconnectJob = null
-            sessionManifest = null
-            sinks.clear()
-            committedFiles.clear()
+            transfer = null
             publishLocked(ReceiverState.Idle)
             true
         }
@@ -516,25 +434,19 @@ class ReceiverStateMachine(
         reconnectJob?.cancel()
         promptJob?.cancel()
         lifetimeJob?.cancel()
-        val connection = activeConnection
-        activeConnection = null
-        val oldWorker = worker
-        val sid = activeOffer?.sessionId?.copyOf()
+        val connections = activeConnections.toList()
+        activeConnections.clear()
+        val oldWorkers = workers.toList()
+        val shared = transfer
 
         cleanupJob = scope.launch(NonCancellable) {
             try {
-                runCatching { connection?.cancelAndClose(reason) }
+                connections.forEach { runCatching { it.cancelAndClose(reason) } }
                 linksClosed.complete(Unit)
-                oldWorker?.cancelAndJoin()
+                oldWorkers.forEach { it.cancel() }
+                oldWorkers.joinAll()
                 lifetimeJob?.join()
-                // Snapshot after the worker stops mutating sink/manifest bookkeeping.
-                sinks.forEach { (id, sink) ->
-                    if (id !in committedFiles) runCatching { sink.discard() }
-                    runCatching { sink.close() }
-                }
-                if (sid != null) sessionManifest?.files?.forEach { file ->
-                    runCatching { resumeStore.clear(sid, file.id) }
-                }
+                shared?.cleanup()
             } finally {
                 linksClosed.complete(Unit)
                 runCatching { onCleanup?.invoke() }

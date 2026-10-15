@@ -16,7 +16,8 @@ internal class PeerCancelledException(val reason: String) : Exception(reason)
 /** One socket reader and serialized writes, independent of file IO/verification. */
 internal class SessionConnection(
     private val transport: Connection,
-    private val timeouts: Timeouts
+    private val timeouts: Timeouts,
+    private val consumeAcks: Boolean = false
 ) : Connection {
     private val writes = Mutex()
     private val frames = Channel<RawFrame>(Channel.RENDEZVOUS)
@@ -34,6 +35,10 @@ internal class SessionConnection(
                             if (!ping.reply) writeFrame(ProtocolCodec.encodeToFrame(
                                 FrameType.PING, ping.copy(reply = true)
                             ))
+                        }
+                        FrameType.ACK -> {
+                            if (consumeAcks) ProtocolCodec.decodePayload<AckMessage>(frame)
+                            else frames.send(frame)
                         }
                         FrameType.CANCEL -> throw PeerCancelledException(
                             ProtocolCodec.decodePayload<CancelMessage>(frame).reason
@@ -94,6 +99,13 @@ internal class SessionConnection(
 
     override suspend fun readFrame(): RawFrame = frames.receive()
 
+    suspend fun readFrameOrSignal(signal: Deferred<*>): RawFrame? = select {
+        frames.onReceive { it }
+        signal.onAwait { null }
+    }
+
+    suspend fun completeAndClose() = sendBeforeClose(RawFrame(FrameType.DONE, ByteArray(0)))
+
     override suspend fun writeFrame(frame: RawFrame) {
         writes.withLock {
             try {
@@ -110,19 +122,18 @@ internal class SessionConnection(
 
     override suspend fun close() = transport.close()
 
-    suspend fun cancelAndClose(reason: String?) = supervisorScope {
-        // A watchdog bounds even a blocked write or a held write mutex.
+    suspend fun cancelAndClose(reason: String?) = sendBeforeClose(reason?.let {
+        ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage(it.take(1024)))
+    })
+
+    private suspend fun sendBeforeClose(frame: RawFrame?) = supervisorScope {
         val watchdog = launch {
             delay(250)
             runCatching { transport.close() }
         }
         try {
-            if (reason != null && !isClosed) {
-                withTimeoutOrNull(250) {
-                    runCatching { writeFrame(ProtocolCodec.encodeToFrame(
-                        FrameType.CANCEL, CancelMessage(reason.take(1024))
-                    )) }
-                }
+            if (frame != null && !isClosed) {
+                withTimeoutOrNull(250) { runCatching { writeFrame(frame) } }
             }
         } finally {
             runCatching { transport.close() }

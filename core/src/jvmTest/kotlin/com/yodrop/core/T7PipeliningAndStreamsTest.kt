@@ -1,189 +1,252 @@
-﻿package com.yodrop.core
+package com.yodrop.core
 
-import com.yodrop.core.crypto.CryptoEngine
-import com.yodrop.core.crypto.NonceUtils
-import com.yodrop.core.platform.DiskFileSink
-import com.yodrop.core.platform.DiskFileSource
-import com.yodrop.core.platform.createPlatformServerSocket
-import com.yodrop.core.platform.createPlatformSocket
+import com.yodrop.core.platform.*
 import com.yodrop.core.protocol.*
-import com.yodrop.core.session.SenderState
-import com.yodrop.core.session.SenderStateMachine
-import com.yodrop.core.transfer.ChunkBitmap
-import com.yodrop.core.transfer.ChunkPlanner
+import com.yodrop.core.session.*
 import com.yodrop.core.transport.Connection
+import com.yodrop.core.transport.LoopbackConnection
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 import java.io.File
-import java.io.RandomAccessFile
+import java.nio.file.Files
 import java.security.MessageDigest
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertTrue
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.test.*
 
+/** All protocol handling is performed by the real state machines. Wrappers inject faults only. */
 class T7PipeliningAndStreamsTest {
-
-    private class SocketConn(private val socket: com.yodrop.core.platform.PlatformSocket) : Connection {
+    private class Wire(private val socket: PlatformSocket) : Connection {
         override val isClosed: Boolean get() = !socket.isConnected
         override suspend fun readFrame(): RawFrame = socket.readFrame()
         override suspend fun writeFrame(frame: RawFrame) = socket.writeFrame(frame)
         override suspend fun close() = socket.close()
     }
+    private suspend fun tcpPair(): Pair<Connection, Connection> = coroutineScope {
+        val server = createPlatformServerSocket(0)
+        try {
+            val accepted = async { server.accept() }
+            val client = createPlatformSocket()
+            client.connect("127.0.0.1", server.localPort)
+            Wire(accepted.await()) to Wire(client)
+        } finally { server.close() }
+    }
+    private fun makeFile(file: File, megabytes: Int, seed: Int): ByteArray {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val block = ByteArray(1024 * 1024) { ((it + seed) % 241).toByte() }
+        file.outputStream().use { out -> repeat(megabytes) { out.write(block); digest.update(block) } }
+        return digest.digest()
+    }
+    private fun hash(file: File): ByteArray {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) { val n = input.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) }
+        }
+        return digest.digest()
+    }
+    private suspend fun handshake(sender: SenderStateMachine, receiver: ReceiverStateMachine) {
+        receiver.startScanning()
+        receiver.onOfferDiscovered(assertIs<SenderState.Advertising>(sender.state.value).offer)
+        sender.onClaimReceived(receiver.claimOffer())
+        receiver.state.first { it is ReceiverState.AcceptPrompt }
+        val link = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 1234)
+        sender.onDecisionReceived(receiver.acceptTransfer(link), link)
+    }
+    private fun header(payload: ByteArray): Pair<String, Pair<Int, Int>> {
+        val n = payload[0].toInt() and 0xff
+        fun intAt(offset: Int): Int {
+            var value = 0
+            repeat(4) { value = (value shl 8) or (payload[offset + it].toInt() and 0xff) }
+            return value
+        }
+        return payload.decodeToString(1, 1 + n) to (intAt(1 + n) to intAt(5 + n))
+    }
+
+    private fun exercise(mode: String) = runBlocking<Unit>(Dispatchers.IO) {
+        withTimeout(60_000) {
+            val dir = Files.createTempDirectory("yodrop-step9-$mode").toFile()
+            val job = SupervisorJob()
+            val owner = CoroutineScope(Dispatchers.IO + job)
+            val senderClosed = CompletableDeferred<Unit>()
+            val receiverClosed = CompletableDeferred<Unit>()
+            val sender = SenderStateMachine(owner, onCleanup = { senderClosed.complete(Unit) })
+            val receiver = ReceiverStateMachine(owner,
+                onCleanup = { receiverClosed.complete(Unit) },
+                sinkFactory = { DiskFileSink(it.id, dir.resolve("received-${it.name}")) }, requestWindow = 2)
+            val pairs = (0 until 4).map { tcpPair() }
+            val firstRequests = AtomicInteger()
+            val requestsReady = CompletableDeferred<Unit>()
+            val corrupted = AtomicBoolean()
+            val nacks = AtomicInteger()
+            val auths = AtomicInteger()
+            val chunksBySocket = List(4) { AtomicInteger() }
+            val attempts = ConcurrentHashMap<String, MutableSet<Int>>()
+            val assignments = ConcurrentHashMap<String, AtomicInteger>()
+            try {
+                val files = listOf(32, 16).mapIndexed { index, size ->
+                    val source = dir.resolve("file$index.dat")
+                    val sha = makeFile(source, size, index)
+                    FileMeta("file$index", source.name, source.length(), "application/octet-stream", sha)
+                }
+                sender.onGrabbed(files, files.associate { it.id to DiskFileSource(it.id, dir.resolve(it.name)) })
+                handshake(sender, receiver)
+                pairs.forEachIndexed { index, (a, b) ->
+                    assertTrue(sender.attachConnection(object : Connection by a {
+                        override suspend fun writeFrame(frame: RawFrame) {
+                            if (frame.type == FrameType.AUTH) auths.incrementAndGet()
+                            var outgoing = frame
+                            if (frame.type == FrameType.CHUNK_DATA) {
+                                chunksBySocket[index].incrementAndGet()
+                                val (id, numbers) = header(frame.payload)
+                                val key = "$id/${numbers.first}"
+                                attempts.computeIfAbsent(key) { ConcurrentHashMap.newKeySet() }.add(numbers.second)
+                                if (index == 0 && (mode == "exhaust" ||
+                                    (mode == "retry" && corrupted.compareAndSet(false, true)))) {
+                                    val damaged = frame.payload.copyOf()
+                                    damaged[damaged.lastIndex] = (damaged.last().toInt() xor 1).toByte()
+                                    outgoing = RawFrame(frame.type, damaged)
+                                }
+                            }
+                            a.writeFrame(outgoing)
+                        }
+                    }))
+                    val first = AtomicBoolean(true)
+                    assertTrue(receiver.attachConnection(object : Connection by b {
+                        override suspend fun writeFrame(frame: RawFrame) {
+                            if (frame.type == FrameType.NACK) {
+                                val nack = ProtocolCodec.decodePayload<NackMessage>(frame)
+                                assertEquals("CHUNK_AUTHENTICATION_FAILED", nack.reason)
+                                nacks.incrementAndGet()
+                            }
+                            if (frame.type == FrameType.CHUNK_REQ) {
+                                val request = ProtocolCodec.decodePayload<ChunkReqMessage>(frame)
+                                request.chunkIndices.forEach { chunk ->
+                                    assignments.computeIfAbsent("${request.fileId}/$chunk") { AtomicInteger() }.incrementAndGet()
+                                }
+                                if (first.compareAndSet(true, false)) {
+                                    if (firstRequests.incrementAndGet() == 4) requestsReady.complete(Unit)
+                                    requestsReady.await()
+                                }
+                            }
+                            b.writeFrame(frame)
+                        }
+                    }))
+                }
+                val s = sender.state.first { it is SenderState.Done || it is SenderState.Failed || it is SenderState.Cancelled }
+                assertEquals(SenderState.Done, s)
+                val r = receiver.state.first { it is ReceiverState.Done || it is ReceiverState.Failed || it is ReceiverState.Cancelled }
+                assertEquals(ReceiverState.Done, r)
+                senderClosed.await(); receiverClosed.await()
+                assertEquals(4, auths.get())
+                assertTrue(chunksBySocket.all { it.get() > 0 }, "All four real sockets must carry chunks")
+                assertEquals(12, assignments.size)
+                assertEquals(1, sender.transitions.replayCache.count { it is SenderState.Done })
+                assertEquals(1, receiver.transitions.replayCache.count { it is ReceiverState.Done })
+                assertFalse(sender.transitions.replayCache.any { it is SenderState.Failed })
+                assertFalse(receiver.transitions.replayCache.any { it is ReceiverState.Failed })
+                for (file in files) {
+                    val target = dir.resolve("received-${file.name}")
+                    assertEquals(file.size, target.length())
+                    assertContentEquals(file.sha256, hash(target))
+                    assertFalse(dir.resolve("received-${file.name}.part").exists())
+                }
+                if (mode == "retry") {
+                    assertEquals(1, nacks.get())
+                    assertEquals(1, attempts.values.count { it.size == 2 }, "Retry must use a fresh attempt/nonce counter")
+                    assertTrue(assignments.values.all { it.get() == 1 }, "NACK retains its lease; no duplicate initial requests")
+                    assertEquals(13, chunksBySocket.sumOf { it.get() })
+                } else {
+                    assertTrue(nacks.get() >= 2)
+                    assertTrue(pairs[0].second.isClosed)
+                    assertTrue(assignments.values.any { it.get() > 1 }, "Failed worker's leases must be reassigned")
+                }
+                println("Step9 TCP: 4 authenticated sockets; 2 files / 48 MiB; mode=$mode; NACK=${nacks.get()}; Done once; both SHA-256 matched")
+            } finally {
+                withContext(NonCancellable) {
+                    sender.cancel("teardown"); receiver.cancel("teardown")
+                    job.cancelAndJoin()
+                    pairs.forEach { (a, b) -> runCatching { a.close() }; runCatching { b.close() } }
+                    withTimeoutOrNull(5_000) { senderClosed.await(); receiverClosed.await() }
+                    dir.deleteRecursively()
+                }
+            }
+        }
+    }
+
+    @Test fun testFourParallelConnectionsAndNackHandling() = exercise("retry")
+    @Test fun retryExhaustionOnOneWorkerReassignsItsChunksWithoutFailingSession() = exercise("exhaust")
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun fifthConnectionIsRejectedAndClosedOnBothSides() = kotlinx.coroutines.test.runTest {
+        val sender = SenderStateMachine(backgroundScope)
+        val receiver = ReceiverStateMachine(backgroundScope, sinkFactory = { MemoryFileSink(it.id) })
+        val bytes = byteArrayOf(1)
+        val file = FileMeta("file", "file.dat", 1, "text/plain",
+            com.yodrop.core.crypto.CryptoEngine.sha256(bytes))
+        sender.onGrabbed(listOf(file), mapOf("file" to MemoryFileSource("file", bytes)))
+        handshake(sender, receiver)
+        repeat(4) {
+            val (a, b) = LoopbackConnection.createPair()
+            assertTrue(sender.attachConnection(a))
+            assertTrue(receiver.attachConnection(b))
+        }
+        val (extraSender, extraReceiver) = LoopbackConnection.createPair()
+        assertFalse(sender.attachConnection(extraSender))
+        assertFalse(receiver.attachConnection(extraReceiver))
+        assertTrue(extraSender.isClosed)
+        assertTrue(extraReceiver.isClosed)
+        sender.cancel("teardown")
+        receiver.cancel("teardown")
+    }
 
     @Test
-    fun testFourParallelConnectionsAndNackHandling() {
-        runBlocking(Dispatchers.IO) {
-            val tempDir = File(System.getProperty("java.io.tmpdir"), "yodrop-parallel-test-${System.currentTimeMillis()}")
-            tempDir.mkdirs()
-
-            // 16 MiB test file (4 chunks of 4 MiB)
-            val testFileSize = 16L * 1024L * 1024L
-            val srcFile = File(tempDir, "parallel_source.dat")
-            val raf = RandomAccessFile(srcFile, "rw")
-            val pattern = ByteArray(1024 * 1024) { (it % 239).toByte() }
-            for (i in 0 until 16) {
-                raf.write(pattern)
-            }
-            raf.close()
-
-            val digest = MessageDigest.getInstance("SHA-256")
-            val checkRaf = RandomAccessFile(srcFile, "r")
-            val buf = ByteArray(64 * 1024)
-            var read: Int
-            while (checkRaf.read(buf).also { read = it } != -1) {
-                digest.update(buf, 0, read)
-            }
-            checkRaf.close()
-            val expectedSha = digest.digest()
-
-            val dstFile = File(tempDir, "parallel_received.dat")
-            val sink = DiskFileSink("par-f1", dstFile)
-
-            val meta = FileMeta("par-f1", "parallel_source.dat", testFileSize, "application/octet-stream", expectedSha)
-            val source = DiskFileSource(meta.id, srcFile)
-
-            val server = createPlatformServerSocket(0)
-            val port = server.localPort
-
-            val sender = SenderStateMachine(this)
-            sender.onGrabbed(listOf(meta), mapOf(meta.id to source))
-            val offer = (sender.state.value as SenderState.Advertising).offer
-
-            val rxKey = CryptoEngine.generateX25519KeyPair()
-            val sharedSecret = CryptoEngine.computeSharedSecret(rxKey.privateKey, offer.senderPubKey)
-            val keys = CryptoEngine.deriveSessionKeys(sharedSecret, offer.sessionId)
-
-            val claim = ClaimMessage(offer.sessionId, rxKey.publicKey)
-            sender.onClaimReceived(claim)
-            sender.onDecisionReceived(
-                DecisionMessage(offer.sessionId, true),
-                LinkInfoMessage(LinkType.LAN, "127.0.0.1", port)
-            )
-
-            val parallelConnectionsCount = 4
-            val totalChunks = 4
-            val sharedBitmap = ChunkBitmap(totalChunks)
-            val lock = Any()
-
-            val activeClientConns = mutableListOf<Connection>()
-
-            val receiverJobs = (0 until parallelConnectionsCount).map { workerId ->
-                async {
-                    val clientSock = createPlatformSocket()
-                    clientSock.connect("127.0.0.1", port)
-                    val conn = SocketConn(clientSock)
-                    synchronized(activeClientConns) {
-                        activeClientConns.add(conn)
+    fun requestWindowRefillsBeforeItsLastOutstandingChunkArrives() = runBlocking<Unit>(Dispatchers.IO) {
+        withTimeout(15_000) {
+            val dir = Files.createTempDirectory("yodrop-step9-window").toFile()
+            val job = SupervisorJob()
+            val owner = CoroutineScope(Dispatchers.IO + job)
+            val senderClosed = CompletableDeferred<Unit>()
+            val receiverClosed = CompletableDeferred<Unit>()
+            val sender = SenderStateMachine(owner, onCleanup = { senderClosed.complete(Unit) })
+            val receiver = ReceiverStateMachine(owner, onCleanup = { receiverClosed.complete(Unit) },
+                sinkFactory = { DiskFileSink(it.id, dir.resolve("received.dat")) }, requestWindow = 2)
+            val (a, b) = LoopbackConnection.createPair()
+            val refill = CompletableDeferred<Unit>()
+            try {
+                val source = dir.resolve("file.dat")
+                val sha = makeFile(source, 20, 3)
+                val file = FileMeta("file", source.name, source.length(), "application/octet-stream", sha)
+                sender.onGrabbed(listOf(file), mapOf(file.id to DiskFileSource(file.id, source)))
+                handshake(sender, receiver)
+                sender.attachConnection(object : Connection by a {
+                    override suspend fun writeFrame(frame: RawFrame) {
+                        if (frame.type == FrameType.CHUNK_DATA && header(frame.payload).second.first == 1) refill.await()
+                        a.writeFrame(frame)
                     }
-
-                    // Mutual AUTH
-                    val myAuthPayload = "authreceiver".encodeToByteArray() + offer.sessionId
-                    val myAuthTag = CryptoEngine.computeHmacSha256(keys.receiverToSenderKey, myAuthPayload)
-                    val myAuthMsg = AuthMessage(offer.sessionId, myAuthTag)
-
-                    conn.readFrame()
-                    conn.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, myAuthMsg))
-
-                    val manifestFrame = conn.readFrame()
-                    val manifest = ProtocolCodec.decodePayload<ManifestMessage>(manifestFrame)
-
-                    // Worker pulls chunk assigned to its workerId
-                    val assignedChunk = workerId
-                    val req = ChunkReqMessage(meta.id, listOf(assignedChunk))
-                    conn.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CHUNK_REQ, req))
-
-                    val dataFrame = conn.readFrame()
-                    require(dataFrame.type == FrameType.CHUNK_DATA)
-
-                    val payload = dataFrame.payload
-                    val idLen = payload[0].toInt() and 0xFF
-                    val fileId = payload.decodeToString(1, 1 + idLen)
-                    var off = 1 + idLen
-                    val chunkIdx = ((payload[off].toInt() and 0xFF) shl 24) or
-                            ((payload[off + 1].toInt() and 0xFF) shl 16) or
-                            ((payload[off + 2].toInt() and 0xFF) shl 8) or
-                            (payload[off + 3].toInt() and 0xFF)
-                    off += 4
-                    val attempt = ((payload[off].toInt() and 0xFF) shl 24) or
-                            ((payload[off + 1].toInt() and 0xFF) shl 16) or
-                            ((payload[off + 2].toInt() and 0xFF) shl 8) or
-                            (payload[off + 3].toInt() and 0xFF)
-                    off += 4
-                    val ciphertext = payload.copyOfRange(off, payload.size)
-
-                    val nonce = NonceUtils.buildChunkNonce(keys.nonceBase, chunkIdx, attempt)
-                    val aad = NonceUtils.buildAad(offer.sessionId, fileId, chunkIdx)
-                    val plaintext = CryptoEngine.decryptAesGcm(keys.senderToReceiverKey, nonce, ciphertext, aad)
-
-                    val (start, _) = ChunkPlanner.getChunkByteRange(chunkIdx, meta.size, manifest.chunkSize)
-                    sink.writeChunk(start, plaintext)
-
-                    synchronized(lock) {
-                        sharedBitmap.markReceived(chunkIdx)
+                })
+                receiver.attachConnection(object : Connection by b {
+                    override suspend fun writeFrame(frame: RawFrame) {
+                        if (frame.type == FrameType.CHUNK_REQ &&
+                            2 in ProtocolCodec.decodePayload<ChunkReqMessage>(frame).chunkIndices) refill.complete(Unit)
+                        b.writeFrame(frame)
                     }
-
-                    // Test NACK handling on worker 0: trigger re-request for chunk 0
-                    if (workerId == 0) {
-                        val nack = NackMessage(meta.id, listOf(0))
-                        conn.writeFrame(ProtocolCodec.encodeToFrame(FrameType.NACK, nack))
-                        val retransmittedFrame = conn.readFrame()
-                        require(retransmittedFrame.type == FrameType.CHUNK_DATA)
-                    }
+                })
+                assertEquals(SenderState.Done, sender.state.first { it is SenderState.Done || it is SenderState.Failed })
+                assertEquals(ReceiverState.Done, receiver.state.first { it is ReceiverState.Done || it is ReceiverState.Failed })
+                senderClosed.await(); receiverClosed.await()
+                assertTrue(refill.isCompleted)
+                assertContentEquals(sha, hash(dir.resolve("received.dat")))
+            } finally {
+                withContext(NonCancellable) {
+                    sender.cancel("teardown"); receiver.cancel("teardown")
+                    job.cancelAndJoin()
+                    withTimeoutOrNull(5_000) { senderClosed.await(); receiverClosed.await() }
+                    dir.deleteRecursively()
                 }
             }
-
-            // Accept 4 incoming socket connections on Sender side
-            for (i in 0 until parallelConnectionsCount) {
-                val sock = server.accept()
-                sender.attachConnection(SocketConn(sock))
-            }
-
-            receiverJobs.awaitAll()
-
-            // Verify all chunks are marked complete across all 4 parallel workers
-            assertTrue(sharedBitmap.isComplete(), "All 4 chunks must be marked complete in shared bitmap")
-
-            // Verify file checksum
-            val matches = sink.verifySha256(meta.sha256)
-            sink.commit()
-            sink.close()
-
-            assertTrue(matches, "Final reassembled parallel-stream file must match SHA-256")
-
-            // Send FILE_DONE on connection 0 to signal clean sender completion
-            activeClientConns.firstOrNull()?.writeFrame(
-                ProtocolCodec.encodeToFrame(FrameType.FILE_DONE, FileDoneMessage(meta.id, true))
-            )
-
-            withTimeout(3000) {
-                while (sender.state.value !is SenderState.Done) {
-                    delay(20)
-                }
-            }
-            assertEquals(SenderState.Done, sender.state.value)
-
-            activeClientConns.forEach { runCatching { it.close() } }
-            server.close()
-            tempDir.deleteRecursively()
         }
     }
 }
