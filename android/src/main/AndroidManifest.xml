@@ -22,6 +22,10 @@
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" tools:targetApi="tiramisu" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" tools:targetApi="tiramisu" />
 
+    <!-- Foreground Service Permission for Android 14+ (API 34+) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
     <!-- Camera for Gesture Detection (P6) -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera.front" android:required="false" />
@@ -34,6 +38,7 @@
         android:roundIcon="@android:drawable/ic_menu_share"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -42,5 +47,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".service.TransferForegroundService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
     </application>
 </manifest>
