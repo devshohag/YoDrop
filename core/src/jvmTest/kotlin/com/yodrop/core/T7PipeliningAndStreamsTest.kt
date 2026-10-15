@@ -68,7 +68,6 @@ class T7PipeliningAndStreamsTest {
             sender.onGrabbed(listOf(meta), mapOf(meta.id to source))
             val offer = (sender.state.value as SenderState.Advertising).offer
 
-            // Handshake derive session keys
             val rxKey = CryptoEngine.generateX25519KeyPair()
             val sharedSecret = CryptoEngine.computeSharedSecret(rxKey.privateKey, offer.senderPubKey)
             val keys = CryptoEngine.deriveSessionKeys(sharedSecret, offer.sessionId)
@@ -85,19 +84,23 @@ class T7PipeliningAndStreamsTest {
             val sharedBitmap = ChunkBitmap(totalChunks)
             val lock = Any()
 
-            // Launch 4 parallel receiver connections
+            val activeClientConns = mutableListOf<Connection>()
+
             val receiverJobs = (0 until parallelConnectionsCount).map { workerId ->
                 async {
                     val clientSock = createPlatformSocket()
                     clientSock.connect("127.0.0.1", port)
                     val conn = SocketConn(clientSock)
+                    synchronized(activeClientConns) {
+                        activeClientConns.add(conn)
+                    }
 
                     // Mutual AUTH
                     val myAuthPayload = "authreceiver".encodeToByteArray() + offer.sessionId
                     val myAuthTag = CryptoEngine.computeHmacSha256(keys.receiverToSenderKey, myAuthPayload)
                     val myAuthMsg = AuthMessage(offer.sessionId, myAuthTag)
 
-                    val sAuth = conn.readFrame()
+                    conn.readFrame()
                     conn.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, myAuthMsg))
 
                     val manifestFrame = conn.readFrame()
@@ -145,8 +148,6 @@ class T7PipeliningAndStreamsTest {
                         val retransmittedFrame = conn.readFrame()
                         require(retransmittedFrame.type == FrameType.CHUNK_DATA)
                     }
-
-                    conn.close()
                 }
             }
 
@@ -167,6 +168,20 @@ class T7PipeliningAndStreamsTest {
             sink.close()
 
             assertTrue(matches, "Final reassembled parallel-stream file must match SHA-256")
+
+            // Send FILE_DONE on connection 0 to signal clean sender completion
+            activeClientConns.firstOrNull()?.writeFrame(
+                ProtocolCodec.encodeToFrame(FrameType.FILE_DONE, FileDoneMessage(meta.id, true))
+            )
+
+            withTimeout(3000) {
+                while (sender.state.value !is SenderState.Done) {
+                    delay(20)
+                }
+            }
+            assertEquals(SenderState.Done, sender.state.value)
+
+            activeClientConns.forEach { runCatching { it.close() } }
             server.close()
             tempDir.deleteRecursively()
         }

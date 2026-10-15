@@ -1,42 +1,47 @@
 ﻿package com.yodrop.core.session
 
-import com.yodrop.core.protocol.FileMeta
 import com.yodrop.core.protocol.LinkInfoMessage
 import com.yodrop.core.protocol.OfferMessage
 
 sealed interface SenderState {
-    data object Idle : SenderState
-    data class Grabbed(val files: List<FileMeta>) : SenderState
+    object Idle : SenderState
     data class Advertising(val offer: OfferMessage) : SenderState
-    data class Claimed(val receiverPubKey: ByteArray) : SenderState
     data class AwaitAccept(val verifyCode: String) : SenderState
     data class Linking(val linkInfo: LinkInfoMessage) : SenderState
-    data object Auth : SenderState
-    data class Transferring(val progressPercent: Float, val currentFile: String) : SenderState
-    data object Done : SenderState
-    data class Failed(val error: String) : SenderState
+    object Auth : SenderState
+    data class Transferring(val progress: Float, val currentFileName: String) : SenderState
+    object Done : SenderState
     data class Cancelled(val reason: String) : SenderState
+    data class Failed(val error: String) : SenderState
 }
 
 sealed interface ReceiverState {
-    data object Idle : ReceiverState
-    data object Scanning : ReceiverState
+    object Idle : ReceiverState
+    object Scanning : ReceiverState
     data class OfferSeen(val offer: OfferMessage) : ReceiverState
-    data object Claimed : ReceiverState
+    object Claimed : ReceiverState
     data class AcceptPrompt(val offer: OfferMessage, val verifyCode: String) : ReceiverState
     data class Linking(val linkInfo: LinkInfoMessage) : ReceiverState
-    data object Auth : ReceiverState
-    data class Receiving(val progressPercent: Float, val currentFile: String) : ReceiverState
+    object Auth : ReceiverState
+    data class Receiving(val progress: Float, val currentFileName: String) : ReceiverState
     data class Verifying(val fileId: String) : ReceiverState
-    data object Done : ReceiverState
-    data class Failed(val error: String) : ReceiverState
+    object Done : ReceiverState
     data class Cancelled(val reason: String) : ReceiverState
+    data class Failed(val error: String) : ReceiverState
 }
 
 object SessionTimeouts {
-    const val OFFER_TIMEOUT_MS = 60_000L      // 60s offer window
-    const val CLAIM_WINDOW_MS = 10_000L       // 10s claim window
-    const val LINKING_TIMEOUT_MS = 20_000L    // 20s link setup timeout
-    const val SOCKET_IDLE_TIMEOUT_MS = 15_000L // 15s socket idle timeout
-    const val PING_INTERVAL_MS = 5_000L       // 5s ping
+    var OFFER_TIMEOUT_MS: Long = 60_000L
+    var CLAIM_TIMEOUT_MS: Long = 10_000L
+    var LINKING_TIMEOUT_MS: Long = 20_000L
+    var SOCKET_IDLE_TIMEOUT_MS: Long = 15_000L
+    var PING_INTERVAL_MS: Long = 5_000L
+
+    fun resetToDefaults() {
+        OFFER_TIMEOUT_MS = 60_000L
+        CLAIM_TIMEOUT_MS = 10_000L
+        LINKING_TIMEOUT_MS = 20_000L
+        SOCKET_IDLE_TIMEOUT_MS = 15_000L
+        PING_INTERVAL_MS = 5_000L
+    }
 }

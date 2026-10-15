@@ -16,7 +16,8 @@ import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicInteger
 
 class SenderStateMachine(
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val onCleanup: (() -> Unit)? = null
 ) {
     private val _state = MutableStateFlow<SenderState>(SenderState.Idle)
     val state: StateFlow<SenderState> = _state.asStateFlow()
@@ -28,6 +29,10 @@ class SenderStateMachine(
     private var fileSourceMap: Map<String, FileSource> = emptyMap()
     private val activeConnections = mutableListOf<Connection>()
     private val attemptCounter = AtomicInteger(0)
+
+    private var offerTimeoutJob: Job? = null
+    private var claimTimeoutJob: Job? = null
+    private var linkingTimeoutJob: Job? = null
 
     fun onGrabbed(files: List<FileMeta>, sources: Map<String, FileSource>) {
         filesToSend = files
@@ -49,9 +54,18 @@ class SenderStateMachine(
             previewName = files.firstOrNull()?.name ?: "Unknown"
         )
         _state.value = SenderState.Advertising(offer)
+
+        offerTimeoutJob?.cancel()
+        offerTimeoutJob = scope.launch {
+            delay(SessionTimeouts.OFFER_TIMEOUT_MS)
+            if (_state.value is SenderState.Advertising) {
+                fail("Offer expired after ${SessionTimeouts.OFFER_TIMEOUT_MS}ms")
+            }
+        }
     }
 
     fun onClaimReceived(claim: ClaimMessage) {
+        offerTimeoutJob?.cancel()
         val keyPair = myKeyPair ?: return
         val sid = sessionId ?: return
         val sharedSecret = CryptoEngine.computeSharedSecret(keyPair.privateKey, claim.receiverPubKey)
@@ -59,30 +73,48 @@ class SenderStateMachine(
         sessionKeys = keys
 
         _state.value = SenderState.AwaitAccept(keys.verifyCode)
+
+        claimTimeoutJob?.cancel()
+        claimTimeoutJob = scope.launch {
+            delay(SessionTimeouts.CLAIM_TIMEOUT_MS)
+            if (_state.value is SenderState.AwaitAccept) {
+                fail("Claim decision timed out after ${SessionTimeouts.CLAIM_TIMEOUT_MS}ms")
+            }
+        }
     }
 
     fun onDecisionReceived(decision: DecisionMessage, linkInfo: LinkInfoMessage) {
+        claimTimeoutJob?.cancel()
         if (!decision.accepted) {
-            _state.value = SenderState.Failed("Receiver denied transfer: ${decision.reason}")
+            fail("Receiver denied transfer: ${decision.reason}")
             return
         }
         _state.value = SenderState.Linking(linkInfo)
+
+        linkingTimeoutJob?.cancel()
+        linkingTimeoutJob = scope.launch {
+            delay(SessionTimeouts.LINKING_TIMEOUT_MS)
+            if (_state.value is SenderState.Linking) {
+                fail("Transport linking timed out after ${SessionTimeouts.LINKING_TIMEOUT_MS}ms")
+            }
+        }
     }
 
     fun attachConnection(connection: Connection) {
+        linkingTimeoutJob?.cancel()
         synchronized(activeConnections) {
             activeConnections.add(connection)
         }
         _state.value = SenderState.Auth
-        scope.launch(Dispatchers.IO) {
+        scope.launch {
             try {
                 runTransferWorker(connection)
             } catch (e: CancellationException) {
-                _state.value = SenderState.Cancelled("Cancelled by sender")
-                connection.close()
+                cancel("Cancelled by sender")
             } catch (e: Throwable) {
-                _state.value = SenderState.Failed("Transfer worker failed: ${e.message}")
-                connection.close()
+                if (!connection.isClosed && _state.value !is SenderState.Done) {
+                    fail("Transfer worker failed: ${e.message}")
+                }
             }
         }
     }
@@ -99,16 +131,14 @@ class SenderStateMachine(
         val peerAuthFrame = connection.readFrame()
         if (peerAuthFrame.type != FrameType.AUTH) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Expected AUTH frame")))
-            connection.close()
-            _state.value = SenderState.Failed("Expected AUTH frame, got ${peerAuthFrame.type}")
+            fail("Expected AUTH frame, got ${peerAuthFrame.type}")
             return
         }
 
         val peerAuthMsg = ProtocolCodec.decodePayload<AuthMessage>(peerAuthFrame)
         if (!MessageDigest.isEqual(peerAuthMsg.sessionId, sid)) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("SessionId mismatch")))
-            connection.close()
-            _state.value = SenderState.Failed("SessionId mismatch in AUTH")
+            fail("SessionId mismatch in AUTH")
             return
         }
 
@@ -116,8 +146,7 @@ class SenderStateMachine(
         val expectedReceiverTag = CryptoEngine.computeHmacSha256(keys.receiverToSenderKey, expectedReceiverAuthPayload)
         if (!MessageDigest.isEqual(peerAuthMsg.authTag, expectedReceiverTag)) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("AUTH tag verification failed")))
-            connection.close()
-            _state.value = SenderState.Failed("AUTH tag verification failed")
+            fail("AUTH tag verification failed")
             return
         }
 
@@ -126,8 +155,16 @@ class SenderStateMachine(
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.MANIFEST, manifest))
 
         var completedFiles = 0
-        while (!connection.isClosed) {
-            val frame = connection.readFrame()
+        while (!connection.isClosed && _state.value !is SenderState.Done && _state.value !is SenderState.Failed) {
+            val frame = try {
+                withTimeout(SessionTimeouts.SOCKET_IDLE_TIMEOUT_MS) {
+                    connection.readFrame()
+                }
+            } catch (e: Exception) {
+                // Peer closed stream normally or timeout
+                break
+            }
+
             when (frame.type) {
                 FrameType.CHUNK_REQ -> {
                     val req = ProtocolCodec.decodePayload<ChunkReqMessage>(frame)
@@ -137,15 +174,11 @@ class SenderStateMachine(
                     val nack = ProtocolCodec.decodePayload<NackMessage>(frame)
                     sendRequestedChunks(connection, nack.fileId, nack.chunkIndices, manifest.chunkSize, keys, sid)
                 }
-                FrameType.ACK -> {
-                    // Acknowledgement of chunk receipt
-                }
+                FrameType.ACK -> {}
                 FrameType.PING -> {
                     connection.writeFrame(RawFrame(FrameType.PONG, ByteArray(0)))
                 }
-                FrameType.PONG -> {
-                    // Liveness confirmed
-                }
+                FrameType.PONG -> {}
                 FrameType.FILE_DONE -> {
                     val doneMsg = ProtocolCodec.decodePayload<FileDoneMessage>(frame)
                     if (doneMsg.ok) {
@@ -155,19 +188,22 @@ class SenderStateMachine(
                         if (completedFiles >= filesToSend.size) {
                             connection.writeFrame(RawFrame(FrameType.DONE, ByteArray(0)))
                             _state.value = SenderState.Done
+                            cleanup()
                             return
                         }
                     } else {
-                        throw IllegalStateException("Receiver reported checksum failure on ${doneMsg.fileId}")
+                        fail("Receiver reported checksum failure on ${doneMsg.fileId}")
+                        return
                     }
                 }
                 FrameType.DONE -> {
                     _state.value = SenderState.Done
+                    cleanup()
                     return
                 }
                 FrameType.CANCEL -> {
                     val cancelMsg = ProtocolCodec.decodePayload<CancelMessage>(frame)
-                    _state.value = SenderState.Cancelled(cancelMsg.reason)
+                    cancel(cancelMsg.reason)
                     return
                 }
             }
@@ -216,22 +252,32 @@ class SenderStateMachine(
         }
     }
 
+    fun fail(reason: String) {
+        _state.value = SenderState.Failed(reason)
+        cleanup()
+    }
+
     fun cancel(reason: String = "User cancelled") {
-        scope.launch {
-            synchronized(activeConnections) {
-                activeConnections.forEach { conn ->
-                    runCatching {
-                        if (!conn.isClosed) {
-                            runBlocking {
-                                conn.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage(reason)))
-                                conn.close()
-                            }
-                        }
-                    }
-                }
-                activeConnections.clear()
-            }
-            _state.value = SenderState.Cancelled(reason)
+        _state.value = SenderState.Cancelled(reason)
+        cleanup()
+    }
+
+    fun cleanup() {
+        offerTimeoutJob?.cancel()
+        claimTimeoutJob?.cancel()
+        linkingTimeoutJob?.cancel()
+
+        val connsToClose = synchronized(activeConnections) {
+            val list = activeConnections.toList()
+            activeConnections.clear()
+            list
         }
+        val sourcesToClose = fileSourceMap.values.toList()
+
+        scope.launch {
+            connsToClose.forEach { runCatching { it.close() } }
+            sourcesToClose.forEach { runCatching { it.close() } }
+        }
+        onCleanup?.invoke()
     }
 }

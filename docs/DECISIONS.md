@@ -65,3 +65,14 @@
   - `PING (0x08)` / `PONG (0x09)`: Senders automatically echo PING with PONG to maintain active socket liveness.
 - **Synchronization**:
   - A single `ChunkBitmap` protected by concurrency primitives coordinates parallel TCP worker routines without chunk collision or duplicate downloads.
+
+## [T8] Strict Session Timeouts & Terminal State Resource Cleanup
+- **Decision**: Active timeout timers for each protocol transition and deterministic cleanup hooks.
+- **Timeouts**:
+  - `OFFER_TIMEOUT`: 60 seconds (advertising expires if no CLAIM received).
+  - `CLAIM_TIMEOUT`: 10 seconds (awaiting user accept/deny after claim).
+  - `LINKING_TIMEOUT`: 20 seconds (establishing transport link).
+  - `SOCKET_IDLE_TIMEOUT`: 15 seconds.
+  - `PING_INTERVAL`: 5 seconds.
+- **Cleanup Policy**:
+  - Every transition to `Failed`, `Cancelled`, or `Done` invokes `cleanup()`, closing all sockets, cancelling background jobs, and stopping transports.

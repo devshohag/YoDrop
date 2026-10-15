@@ -20,6 +20,7 @@ import java.security.MessageDigest
 class ReceiverStateMachine(
     private val scope: CoroutineScope,
     private val resumeStore: ResumeStore = InMemoryResumeStore(),
+    private val onCleanup: (() -> Unit)? = null,
     private val sinkFactory: (FileMeta) -> FileSink = { meta ->
         throw NotImplementedError("sinkFactory must be provided for receiving files")
     }
@@ -68,21 +69,20 @@ class ReceiverStateMachine(
     fun denyTransfer(reason: String = "User rejected"): DecisionMessage {
         val offer = activeOffer ?: throw IllegalStateException("No active offer")
         _state.value = ReceiverState.Cancelled(reason)
+        cleanup()
         return DecisionMessage(sessionId = offer.sessionId, accepted = false, reason = reason)
     }
 
     fun attachConnection(connection: Connection) {
         activeConnection = connection
         _state.value = ReceiverState.Auth
-        scope.launch(Dispatchers.IO) {
+        scope.launch {
             try {
                 runReceiveLoop(connection)
             } catch (e: CancellationException) {
-                _state.value = ReceiverState.Cancelled("Cancelled by receiver")
-                connection.close()
+                cancel("Cancelled by receiver")
             } catch (e: Throwable) {
-                _state.value = ReceiverState.Failed("Receive failed: ${e.message}")
-                connection.close()
+                fail("Receive failed: ${e.message}")
             }
         }
     }
@@ -95,16 +95,14 @@ class ReceiverStateMachine(
         val peerAuthFrame = connection.readFrame()
         if (peerAuthFrame.type != FrameType.AUTH) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Expected AUTH frame")))
-            connection.close()
-            _state.value = ReceiverState.Failed("Expected AUTH frame, got ${peerAuthFrame.type}")
+            fail("Expected AUTH frame, got ${peerAuthFrame.type}")
             return
         }
 
         val peerAuthMsg = ProtocolCodec.decodePayload<AuthMessage>(peerAuthFrame)
         if (!MessageDigest.isEqual(peerAuthMsg.sessionId, sid)) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("SessionId mismatch")))
-            connection.close()
-            _state.value = ReceiverState.Failed("SessionId mismatch in AUTH")
+            fail("SessionId mismatch in AUTH")
             return
         }
 
@@ -112,8 +110,7 @@ class ReceiverStateMachine(
         val expectedSenderTag = CryptoEngine.computeHmacSha256(keys.senderToReceiverKey, expectedSenderAuthPayload)
         if (!MessageDigest.isEqual(peerAuthMsg.authTag, expectedSenderTag)) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("AUTH tag verification failed")))
-            connection.close()
-            _state.value = ReceiverState.Failed("AUTH tag verification failed")
+            fail("AUTH tag verification failed")
             return
         }
 
@@ -130,15 +127,12 @@ class ReceiverStateMachine(
             manifest.validate()
         } catch (e: Exception) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Invalid manifest: ${e.message}")))
-            connection.close()
-            _state.value = ReceiverState.Failed("Invalid manifest: ${e.message}")
+            fail("Invalid manifest: ${e.message}")
             return
         }
 
         for ((fileIdx, file) in manifest.files.withIndex()) {
             val totalChunks = ChunkPlanner.calculateTotalChunks(file.size, manifest.chunkSize)
-            
-            // T6: Load persisted resume bitmap if transfer is recovering
             val bitmap = resumeStore.loadBitmap(sid, file.id, totalChunks)
             val sink = sinkFactory(file)
 
@@ -178,7 +172,6 @@ class ReceiverStateMachine(
                         sink.writeChunk(start, plaintext)
                         bitmap.markReceived(chunkIdx)
 
-                        // T6: Save progress to ResumeStore
                         resumeStore.saveBitmap(sid, file.id, bitmap)
 
                         val fileProgress = (fileIdx + (chunkIdx + 1).toFloat() / totalChunks.toFloat()) / manifest.files.size.toFloat()
@@ -191,7 +184,8 @@ class ReceiverStateMachine(
 
                 connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.FILE_DONE, FileDoneMessage(file.id, matches)))
                 if (!matches) {
-                    throw IllegalStateException("Checksum mismatch for file ${file.name}")
+                    fail("Checksum mismatch for file ${file.name}")
+                    return
                 }
                 sink.commit()
                 resumeStore.clear(sid, file.id)
@@ -203,20 +197,26 @@ class ReceiverStateMachine(
         val doneFrame = connection.readFrame()
         require(doneFrame.type == FrameType.DONE) { "Expected DONE frame" }
         _state.value = ReceiverState.Done
+        cleanup()
+    }
+
+    fun fail(reason: String) {
+        _state.value = ReceiverState.Failed(reason)
+        cleanup()
     }
 
     fun cancel(reason: String = "User cancelled") {
+        _state.value = ReceiverState.Cancelled(reason)
+        cleanup()
+    }
+
+    fun cleanup() {
         scope.launch {
-            try {
-                activeConnection?.let {
-                    if (!it.isClosed) {
-                        val frame = ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage(reason))
-                        it.writeFrame(frame)
-                        it.close()
-                    }
-                }
-            } catch (_: Exception) {}
-            _state.value = ReceiverState.Cancelled(reason)
+            runCatching {
+                activeConnection?.close()
+            }
+            activeConnection = null
         }
+        onCleanup?.invoke()
     }
 }
