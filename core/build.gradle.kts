@@ -49,6 +49,8 @@ android {
 }
 
 tasks.named<Test>("jvmTest") {
+    maxHeapSize = "256m"
+    maxParallelForks = 1
     testLogging {
         events("started", "passed", "skipped", "failed", "standardOut", "standardError")
         showExceptions = true
