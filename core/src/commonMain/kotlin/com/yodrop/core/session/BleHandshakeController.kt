@@ -15,6 +15,9 @@ class BleHandshakeController(
     private val receiver: ReceiverStateMachine,
     private val localHello: HelloMessage,
     private val selectTransport: (suspend (HelloMessage) -> TransportSelection)? = null,
+    private val prepareLink: (suspend (HelloMessage, TransportSelection) -> LinkInfoMessage?)? = null,
+    private val onLinkReady: (suspend (LinkInfoMessage) -> Unit)? = null,
+    private val helloSnapshot: (() -> HelloMessage)? = null,
     private val send: suspend (String, BleControlMessage) -> Unit
 ) {
     private val mutex = Mutex()
@@ -35,7 +38,7 @@ class BleHandshakeController(
                 if (peer !in hellos && hellos.size >= 16) return@withLock false
                 val firstHello = peer !in hellos
                 hellos[peer] = message.copy(deviceId = message.deviceId.copyOf())
-                if (firstHello) send(peer, localHello)
+                if (firstHello) send(peer, helloSnapshot?.invoke() ?: localHello)
                 val advertising = sender.state.value as? SenderState.Advertising
                 if (advertising != null) send(peer, advertising.offer)
                 true
@@ -60,12 +63,24 @@ class BleHandshakeController(
             is DecisionMessage -> {
                 if (peer != claimedPeer) return@withLock false
                 // Sender-owned endpoint setup follows explicit consent; no receiver-fabricated IP.
-                sender.onDecisionReceived(message)
+                if (!sender.onDecisionReceived(message)) return@withLock false
+                if (message.accepted && prepareLink != null) {
+                    val choice = _selection.value ?: TransportSelection.Unavailable
+                    val link = prepareLink.invoke(checkNotNull(hellos[peer]), choice)
+                    if (link != null) {
+                        check(choice is TransportSelection.DataLink && choice.linkType == link.linkType)
+                        sender.createEncryptedLinkInfo(link)?.let { send(peer, it) }
+                    }
+                }
+                true
             }
-            is LinkInfoMessage -> {
+            is EncryptedLinkInfoMessage -> {
                 if (peer != offerPeer) return@withLock false
-                receiver.onLinkInfoReceived(message)
+                val link = receiver.onEncryptedLinkInfoReceived(message) ?: return@withLock false
+                onLinkReady?.invoke(link)
+                true
             }
+            is LinkInfoMessage -> false // Plaintext is diagnostic-only and never a session endpoint.
         }
     }
 

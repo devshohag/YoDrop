@@ -1,6 +1,8 @@
 ﻿package com.yodrop.core.protocol
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.cbor.ByteString
 
 @Serializable
 enum class Platform {
@@ -33,7 +35,8 @@ data class HelloMessage(
     val deviceName: String,
     val platform: Platform,
     val capabilities: Int,
-    val deviceId: ByteArray
+    val deviceId: ByteArray,
+    val lanIp: String? = null
 ) : BleControlMessage
 
 @Serializable
@@ -64,4 +67,26 @@ data class LinkInfoMessage(
     val host: String,
     val port: Int,
     val extra: Map<String, String> = emptyMap()
-) : BleControlMessage
+) : BleControlMessage {
+    fun validate() {
+        require(host.isNotBlank() && host.length <= 255 && port in 1..65535) { "Invalid LINK_INFO endpoint" }
+        require(extra.size <= 16 && extra.all {
+            it.key.length <= 128 && it.value.encodeToByteArray().size <= 2048
+        }) { "LINK_INFO metadata too large" }
+        if (linkType == LinkType.HOTSPOT) {
+            require(!extra["ssid"].isNullOrBlank() && !extra["passphrase"].isNullOrBlank()) {
+                "Missing hotspot credentials"
+            }
+        }
+    }
+    override fun toString() = "LinkInfoMessage(linkType=$linkType, host=$host, port=$port, extra=<redacted>)"
+}
+
+@OptIn(ExperimentalSerializationApi::class)
+@Serializable
+data class EncryptedLinkInfoMessage(
+    val counter: Long,
+    @ByteString val ciphertext: ByteArray
+) : BleControlMessage {
+    override fun toString() = "EncryptedLinkInfoMessage(counter=$counter, ciphertext=<redacted>)"
+}

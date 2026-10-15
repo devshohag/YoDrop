@@ -23,8 +23,7 @@ class Step12BleTest {
             BleMessageType.CLAIM to ClaimMessage(sid, ByteArray(32) { 8 }),
             BleMessageType.ACCEPT to DecisionMessage(sid, true),
             BleMessageType.DENY to DecisionMessage(sid, false, "User declined"),
-            BleMessageType.LINK_INFO to LinkInfoMessage(LinkType.LAN, "10.0.0.2", 8888,
-                mapOf("example" to "metadata"))
+            BleMessageType.LINK_INFO to EncryptedLinkInfoMessage(0, ByteArray(17) { 9 })
         )
         for ((type, message) in messages) {
             val bytes = BleMessageCodec.encode(message)
@@ -222,10 +221,12 @@ class Step12BleTest {
         assertFalse(f.sending.onMessage(BlePeerMessage("stranger", DecisionMessage(offer.sessionId, true))))
         assertIs<SenderState.AwaitAccept>(f.sender.state.value)
         f.receiving.accept(); f.pump()
-        assertFalse(f.receiving.onMessage(BlePeerMessage("stranger", link)))
-        assertTrue(f.receiving.onMessage(BlePeerMessage("sender", link)))
-        assertEquals(link, assertIs<ReceiverState.Linking>(f.receiver.state.value).linkInfo)
         assertFalse(f.receiving.onMessage(BlePeerMessage("sender", link)))
+        val encrypted = assertNotNull(f.sender.createEncryptedLinkInfo(link))
+        assertFalse(f.receiving.onMessage(BlePeerMessage("stranger", encrypted)))
+        assertTrue(f.receiving.onMessage(BlePeerMessage("sender", encrypted)))
+        assertEquals(link, assertIs<ReceiverState.Linking>(f.receiver.state.value).linkInfo)
+        assertFalse(f.receiving.onMessage(BlePeerMessage("sender", encrypted)))
     }
 
     @Test

@@ -119,6 +119,39 @@ MTU is not a pass. Save the observed error and rerun after correction.
 
 ## Other pending physical checks
 
+### Step 14: authenticated sender endpoint on the same LAN
+
+Status: **PENDING - no physical Android transfer result recorded.**
+
+1. Install the same Step 14+ debug APK on both phones. Launch normally without
+   diagnostic extras. Connect both to the same Wi-Fi/LAN, with client isolation
+   disabled where possible. Enable Bluetooth and grant requested permissions.
+2. Send a recognizable file of at least 1 MiB, tap Receive this file and compare
+   both four-digit codes before Accept. The sender should choose LAN from the
+   exchanged current IPv4 metadata and its active interface prefix.
+3. After Accept, sender creates its listener and encrypted LINK_INFO; receiver
+   decrypts before TCP connection. Confirm both reach Done and the received file
+   appears in Downloads/YoDrop. Compare file SHA-256 with the original (copy both
+   to the PC and use Get-FileHash if needed). Record bytes and results below.
+4. Repeat Deny and confirm no file/endpoint setup occurs. Reset both apps between
+   attempts. Authentication/tamper rejection is covered by JVM tests; do not claim
+   a physical tamper exercise without a controlled BLE capture/injection setup.
+5. Repeat the earlier GATT probe/matching-code checks on the updated APKs. Probe
+   now uses reserved diagnostic tag 7F, not plaintext LINK_INFO tag 06; its debug
+   launch flags and exact 1024-byte PASS output remain unchanged.
+
+| Observation | Sender / receiver models, Android versions, result |
+| --- | --- |
+| Same-LAN encrypted endpoint + successful file transfer | PENDING |
+| Original and received file SHA-256 matched | PENDING |
+| Deny prevented endpoint/data setup | PENDING |
+| Matching-code/GATT probe regression on updated APKs | PENDING |
+
+Only LAN endpoint setup is currently wired in Android. Wi-Fi Direct and hotspot
+still await Steps 16/17, and small BLE payload data is later work. A pairing/code
+match on different networks does not establish those data links. No hotspot
+credentials should be printed in logcat, error messages or state dumps.
+
 - Step 3: X25519 instrumentation on a real API 29 device.
 - Step 13: 1 KiB GATT round trip at default MTU and negotiated MTU 247.
 - Later transport steps: real Wi-Fi Direct/hotspot lifecycle, throughput and resume.

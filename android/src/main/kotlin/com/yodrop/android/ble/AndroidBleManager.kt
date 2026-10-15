@@ -28,7 +28,8 @@ class AndroidBleManager(
     private val scope: CoroutineScope,
     private val localHello: HelloMessage,
     private val requestedMtu: Int = 247,
-    private val diagnosticsEnabled: Boolean = false
+    private val diagnosticsEnabled: Boolean = false,
+    private val helloSnapshot: (() -> HelloMessage)? = null
 ) {
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? = bluetoothManager.adapter
@@ -400,7 +401,7 @@ class AndroidBleManager(
                     } == BluetoothGatt.GATT_SUCCESS)
                     links.subscribe(link, true)
                     if (diagnosticsEnabled) Log.d("YoDropBLE", "client ATT MTU=${links.mtu(link)}; CCCD enabled")
-                    sendControlMessage(client.device.address, localHello)
+                    sendControlMessage(client.device.address, helloSnapshot?.invoke() ?: localHello)
                     if (diagnosticsEnabled) probeJob = launchWork(epoch) { runProbe(client.device.address, link) }
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED || status != BluetoothGatt.GATT_SUCCESS) {

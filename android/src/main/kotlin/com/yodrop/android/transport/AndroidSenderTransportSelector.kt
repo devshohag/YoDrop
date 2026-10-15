@@ -30,7 +30,7 @@ class AndroidSenderTransportSelector(
         peerIp = peerIp
     )
 
-    private fun activeLanAddress(): LanAddress? {
+    fun activeLanAddress(): LanAddress? {
         val manager = connectivity ?: return null
         val network = manager.activeNetwork ?: return null
         val capabilities = manager.getNetworkCapabilities(network) ?: return null

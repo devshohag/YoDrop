@@ -4,6 +4,7 @@ import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.crypto.KeyPair
 import com.yodrop.core.crypto.NonceUtils
 import com.yodrop.core.crypto.SessionKeys
+import com.yodrop.core.crypto.LinkInfoCipher
 import com.yodrop.core.platform.FileSource
 import com.yodrop.core.protocol.*
 import com.yodrop.core.transfer.ChunkPlanner
@@ -23,7 +24,7 @@ import kotlinx.coroutines.sync.withLock
 
 class SenderStateMachine(
     private val scope: CoroutineScope,
-    private val onCleanup: (() -> Unit)? = null,
+    private val onCleanup: (suspend () -> Unit)? = null,
     private val timeouts: Timeouts = Timeouts()
 ) {
     private val _state = MutableStateFlow<SenderState>(SenderState.Idle)
@@ -50,6 +51,7 @@ class SenderStateMachine(
     private val authenticated = mutableSetOf<SessionConnection>()
     private val attemptMutex = Mutex()
     private var attemptCounter = 0
+    private var linkInfoCounter = 0L // Lifetime monotonic, including resets/failed BLE sends.
     private val workers = mutableListOf<Job>()
     private var cleanupJob: Job? = null
     private var linksClosed = CompletableDeferred<Unit>()
@@ -229,6 +231,20 @@ class SenderStateMachine(
             }
         }
         true
+    }
+
+    suspend fun createEncryptedLinkInfo(linkInfo: LinkInfoMessage): EncryptedLinkInfoMessage? = eventMutex.withLock {
+        val current = _state.value as? SenderState.Linking ?: return@withLock null
+        if (!scope.isActive) return@withLock null
+        if (current.linkInfo != null && current.linkInfo != linkInfo) return@withLock null
+        if (linkInfoCounter > LinkInfoCipher.MAX_COUNTER) {
+            failLocked("LINK_INFO nonce counter exhausted")
+            return@withLock null
+        }
+        val counter = linkInfoCounter++ // Consume before encryption; retries always use a fresh nonce.
+        val encrypted = LinkInfoCipher.seal(checkNotNull(sessionKeys), checkNotNull(sessionId), counter, linkInfo)
+        publishLocked(SenderState.Linking(linkInfo.copy(extra = linkInfo.extra.toMap())))
+        encrypted
     }
 
     suspend fun attachConnection(connection: Connection): Boolean =

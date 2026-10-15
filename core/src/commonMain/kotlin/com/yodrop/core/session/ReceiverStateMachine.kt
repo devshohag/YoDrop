@@ -4,6 +4,7 @@ import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.crypto.KeyPair
 import com.yodrop.core.crypto.NonceUtils
 import com.yodrop.core.crypto.SessionKeys
+import com.yodrop.core.crypto.LinkInfoCipher
 import com.yodrop.core.platform.FileSink
 import com.yodrop.core.protocol.*
 import com.yodrop.core.transfer.ChunkBitmap
@@ -52,6 +53,7 @@ class ReceiverStateMachine(
     private var myKeyPair: KeyPair? = null
     private var sessionKeys: SessionKeys? = null
     private var activeOffer: OfferMessage? = null
+    private var lastLinkInfoCounter = -1L
     private val activeConnections = mutableSetOf<SessionConnection>()
     private val workers = mutableListOf<Job>()
     private var transfer: ReceiveCoordinator? = null
@@ -212,14 +214,19 @@ class ReceiverStateMachine(
             DecisionMessage(offer.sessionId.copyOf(), true)
         }
 
-    /** Only the accepted offer's BLE peer may supply this through the handshake controller. */
-    suspend fun onLinkInfoReceived(linkInfo: LinkInfoMessage): Boolean = eventMutex.withLock {
-        val current = _state.value as? ReceiverState.Linking ?: return@withLock false
-        if (current.linkInfo != null || linkInfo.host.isBlank() || linkInfo.port !in 1..65535) {
-            return@withLock false
+    /** The controller binds the BLE peer; keys/AAD and consent are checked here. */
+    suspend fun onEncryptedLinkInfoReceived(message: EncryptedLinkInfoMessage): LinkInfoMessage? = eventMutex.withLock {
+        val current = _state.value as? ReceiverState.Linking ?: return@withLock null
+        if (!scope.isActive || current.linkInfo != null || message.counter <= lastLinkInfoCounter) return@withLock null
+        val link = try {
+            LinkInfoCipher.open(checkNotNull(sessionKeys), checkNotNull(activeOffer).sessionId, message)
+        } catch (_: Exception) {
+            failLocked("LINK_INFO authentication failed")
+            return@withLock null
         }
-        publishLocked(ReceiverState.Linking(linkInfo))
-        true
+        lastLinkInfoCounter = message.counter
+        publishLocked(ReceiverState.Linking(link))
+        link
     }
 
     suspend fun denyTransfer(
@@ -422,6 +429,7 @@ class ReceiverStateMachine(
             cleanupJob = null
             activeConnections.clear()
             activeOffer = null
+            lastLinkInfoCounter = -1L
             sessionKeys = null
             myKeyPair = null
             linksClosed = CompletableDeferred()

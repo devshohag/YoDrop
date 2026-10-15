@@ -431,3 +431,56 @@
 - Physical two-phone code matching and 1 KiB GATT round trips at MTU 23/247 remain
   pending until docs/MANUAL-TESTS.md records actual devices, MTUs and logs. JVM tests
   and Android compilation do not establish those device acceptance results.
+
+## [Step 14] Sender-owned authenticated LINK_INFO
+- BLE tag 06 now carries only EncryptedLinkInfoMessage(counter,ciphertext), with
+  ciphertext encoded as a CBOR byte string. The inner LinkInfoMessage CBOR,
+  including SSID/passphrase/IP/port, is encrypted with AES-256-GCM. Old plaintext
+  tag-06 payloads fail decoding; no plaintext compatibility fallback exists.
+- A dedicated 32-byte control key is HKDF-Expand(S2R key,
+  info="YoDrop-BLE-S2R-LINK_INFO-v1", L=32), using HMAC-SHA256's single expand block.
+  The existing session-derived directional key is the PRK. Control nonce is
+  ASCII "LINKINFO" (8 bytes) followed by u32be(counter); AAD is exactly the active
+  16-byte sessionId. Control-key separation isolates this domain from TCP chunks.
+  GCM's existing 128-bit authentication tag is retained; no crypto library changed.
+- SenderStateMachine allocates a lifetime-monotonic unsigned-32-bit control
+  counter under its event Mutex, consumes it before encrypting and never rewinds
+  it on reset. Exhaustion fails before wraparound. Retries get fresh counters.
+  Encryption is permitted only after accepted decision in Linking; endpoint
+  replacement during that setup is rejected.
+- Receiver authenticates/decrypts only after local Accept, from the bound OFFER
+  peer, while awaiting its first endpoint. Session AAD, counter/ciphertext bounds
+  and decoded metadata are checked before publication. Invalid authentication is
+  terminal with fixed, credential-free error text. Replay/second endpoints and
+  wrong peers cannot change the accepted link. Inner CBOR is capped at 2048 bytes.
+- SenderLinkInfoFactory builds LAN/WFD/hotspot metadata from actual supplied
+  listener/group/reservation values. Hotspot metadata includes ssid/passphrase;
+  neither receives a default IP or fabricated credentials. LinkInfoMessage and
+  HotspotCredentials redact credentials in toString, including state snapshots.
+- BleHandshakeController prepares a sender endpoint only after valid ACCEPT,
+  encrypts it through the private-key-owning sender machine and sends the envelope.
+  Receiver invokes the platform link consumer only after authenticated decryption.
+  The local injected-link APIs used by existing core TCP tests remain supported;
+  the BLE controller rejects ordinary plaintext LinkInfoMessage objects.
+- HELLO has optional lanIp discovery metadata so Step 11 can compare the peer's
+  actual IPv4 with the sender's real interface prefix. Android snapshots its active
+  LAN address at each HELLO send. No SSID/passphrase is added to HELLO, and the
+  sender still reads current network/prefix when selecting and building its link.
+- AndroidSenderLinkSetup creates a real ephemeral LAN listener, constructs the
+  sender IP/assigned-port endpoint and accepts sockets into the sender machine.
+  Receiver connects only to the authenticated LAN endpoint. The sender cleanup
+  hook is now suspend so it closes the listener and joins its accept worker before
+  cleanup completes. Existing cleanup lambdas remain source-compatible.
+- WFD group ownership and actual hotspot reservations/gateway extraction remain
+  Steps 16/17. Their setup provider returns pending (null) until implemented rather
+  than inventing a gateway. Small BLE data remains the later P10 work. The existing
+  20-second linking deadline still applies when a real link cannot be prepared.
+- The opt-in debug GATT probe moves to reserved tag 7F. It permits only the fixed
+  dummy endpoint, mode Q/R, hex token and x-padding fields; credentials/arbitrary
+  plaintext LINK_INFO cannot be encoded under it. Both request/reply remain exactly
+  1024 bytes. This keeps diagnostics usable without a plaintext tag-06 bypass.
+  Both APKs must update together for the encrypted-envelope/probe-tag wire change.
+- JVM tests verify credential absence, tag/ciphertext/counter/AAD tampering,
+  directional/key separation, consent, retries/reset/parallel counters, replay,
+  redaction and authenticated endpoint-driven real TCP. Physical Android LAN,
+  hotspot and earlier matching-code/GATT acceptances remain unclaimed.

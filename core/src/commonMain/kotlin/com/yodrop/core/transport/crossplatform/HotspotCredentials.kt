@@ -9,4 +9,6 @@ data class HotspotCredentials(
     val passphrase: String,
     val gatewayIp: String,
     val port: Int
-)
+) {
+    override fun toString() = "HotspotCredentials(ssid=<redacted>, passphrase=<redacted>, gatewayIp=$gatewayIp, port=$port)"
+}
