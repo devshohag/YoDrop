@@ -25,12 +25,12 @@ class SenderStateMachine(
     private var filesToSend: List<FileMeta> = emptyList()
     private var fileDataMap: Map<String, ByteArray> = emptyMap()
     private var activeConnection: Connection? = null
-    private var messageCounter = 0
+    private var attemptCounter = 0
 
     fun onGrabbed(files: List<FileMeta>, dataMap: Map<String, ByteArray>) {
         filesToSend = files
         fileDataMap = dataMap
-        messageCounter = 0
+        attemptCounter = 0
 
         val keyPair = CryptoEngine.generateX25519KeyPair()
         myKeyPair = keyPair
@@ -87,13 +87,11 @@ class SenderStateMachine(
         val keys = sessionKeys ?: throw IllegalStateException("No session keys derived")
         val sid = sessionId ?: throw IllegalStateException("No sessionId initialized")
 
-        // 1. Send Sender AUTH: HMAC(senderToReceiverKey, "authsender" || sessionId)
         val authPayload = "authsender".encodeToByteArray() + sid
         val myAuthTag = CryptoEngine.computeHmacSha256(keys.senderToReceiverKey, authPayload)
         val myAuthMsg = AuthMessage(sessionId = sid, authTag = myAuthTag)
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, myAuthMsg))
 
-        // 2. Read and verify Peer AUTH
         val peerAuthFrame = connection.readFrame()
         if (peerAuthFrame.type != FrameType.AUTH) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Expected AUTH frame")))
@@ -103,8 +101,6 @@ class SenderStateMachine(
         }
 
         val peerAuthMsg = ProtocolCodec.decodePayload<AuthMessage>(peerAuthFrame)
-
-        // Verify sessionId match
         if (!MessageDigest.isEqual(peerAuthMsg.sessionId, sid)) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("SessionId mismatch")))
             connection.close()
@@ -112,7 +108,6 @@ class SenderStateMachine(
             return
         }
 
-        // Verify HMAC(receiverToSenderKey, "authreceiver" || sessionId)
         val expectedReceiverAuthPayload = "authreceiver".encodeToByteArray() + sid
         val expectedReceiverTag = CryptoEngine.computeHmacSha256(keys.receiverToSenderKey, expectedReceiverAuthPayload)
         if (!MessageDigest.isEqual(peerAuthMsg.authTag, expectedReceiverTag)) {
@@ -122,11 +117,9 @@ class SenderStateMachine(
             return
         }
 
-        // 3. Send MANIFEST
         val manifest = ManifestMessage(files = filesToSend)
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.MANIFEST, manifest))
 
-        // 4. Chunk exchange loop
         var completedFiles = 0
         while (completedFiles < filesToSend.size && !connection.isClosed) {
             val frame = connection.readFrame()
@@ -140,11 +133,13 @@ class SenderStateMachine(
                         val (start, end) = ChunkPlanner.getChunkByteRange(chunkIdx, fileSize)
                         val slice = rawData.copyOfRange(start.toInt(), end.toInt())
 
-                        val nonce = NonceUtils.build12ByteNonce(keys.nonceBase, messageCounter++)
-                        val ciphertext = CryptoEngine.encryptAesGcm(keys.senderToReceiverKey, nonce, slice)
+                        val currentAttempt = attemptCounter++
+                        val nonce = NonceUtils.buildChunkNonce(keys.nonceBase, chunkIdx, currentAttempt)
+                        val aad = NonceUtils.buildAad(sid, req.fileId, chunkIdx)
+                        val ciphertext = CryptoEngine.encryptAesGcm(keys.senderToReceiverKey, nonce, slice, aad)
 
                         val fileIdBytes = req.fileId.encodeToByteArray()
-                        val payload = ByteArray(1 + fileIdBytes.size + 4 + ciphertext.size)
+                        val payload = ByteArray(1 + fileIdBytes.size + 4 + 4 + ciphertext.size)
                         payload[0] = fileIdBytes.size.toByte()
                         fileIdBytes.copyInto(payload, 1)
                         var off = 1 + fileIdBytes.size
@@ -152,7 +147,13 @@ class SenderStateMachine(
                         payload[off + 1] = ((chunkIdx shr 16) and 0xFF).toByte()
                         payload[off + 2] = ((chunkIdx shr 8) and 0xFF).toByte()
                         payload[off + 3] = (chunkIdx and 0xFF).toByte()
-                        ciphertext.copyInto(payload, off + 4)
+                        off += 4
+                        payload[off] = ((currentAttempt shr 24) and 0xFF).toByte()
+                        payload[off + 1] = ((currentAttempt shr 16) and 0xFF).toByte()
+                        payload[off + 2] = ((currentAttempt shr 8) and 0xFF).toByte()
+                        payload[off + 3] = (currentAttempt and 0xFF).toByte()
+                        off += 4
+                        ciphertext.copyInto(payload, off)
 
                         connection.writeFrame(RawFrame(FrameType.CHUNK_DATA, payload))
                     }

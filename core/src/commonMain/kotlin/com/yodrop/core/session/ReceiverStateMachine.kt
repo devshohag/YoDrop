@@ -87,7 +87,6 @@ class ReceiverStateMachine(
         val offer = activeOffer ?: throw IllegalStateException("No active offer")
         val sid = offer.sessionId
 
-        // 1. Read Peer AUTH
         val peerAuthFrame = connection.readFrame()
         if (peerAuthFrame.type != FrameType.AUTH) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Expected AUTH frame")))
@@ -97,8 +96,6 @@ class ReceiverStateMachine(
         }
 
         val peerAuthMsg = ProtocolCodec.decodePayload<AuthMessage>(peerAuthFrame)
-
-        // Verify sessionId match
         if (!MessageDigest.isEqual(peerAuthMsg.sessionId, sid)) {
             connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("SessionId mismatch")))
             connection.close()
@@ -106,7 +103,6 @@ class ReceiverStateMachine(
             return
         }
 
-        // Verify HMAC(senderToReceiverKey, "authsender" || sessionId)
         val expectedSenderAuthPayload = "authsender".encodeToByteArray() + sid
         val expectedSenderTag = CryptoEngine.computeHmacSha256(keys.senderToReceiverKey, expectedSenderAuthPayload)
         if (!MessageDigest.isEqual(peerAuthMsg.authTag, expectedSenderTag)) {
@@ -116,18 +112,14 @@ class ReceiverStateMachine(
             return
         }
 
-        // 2. Send Receiver AUTH: HMAC(receiverToSenderKey, "authreceiver" || sessionId)
         val myAuthPayload = "authreceiver".encodeToByteArray() + sid
         val myAuthTag = CryptoEngine.computeHmacSha256(keys.receiverToSenderKey, myAuthPayload)
         val myAuthMsg = AuthMessage(sessionId = sid, authTag = myAuthTag)
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, myAuthMsg))
 
-        // 3. Read MANIFEST
         val manifestFrame = connection.readFrame()
         require(manifestFrame.type == FrameType.MANIFEST) { "Expected MANIFEST frame" }
         val manifest = ProtocolCodec.decodePayload<ManifestMessage>(manifestFrame)
-
-        var sessionCounter = 0
 
         for ((fileIdx, file) in manifest.files.withIndex()) {
             val totalChunks = ChunkPlanner.calculateTotalChunks(file.size, manifest.chunkSize)
@@ -153,10 +145,18 @@ class ReceiverStateMachine(
                             ((payload[off + 1].toInt() and 0xFF) shl 16) or
                             ((payload[off + 2].toInt() and 0xFF) shl 8) or
                             (payload[off + 3].toInt() and 0xFF)
-                    val ciphertext = payload.copyOfRange(off + 4, payload.size)
+                    off += 4
+                    val attemptCounter = ((payload[off].toInt() and 0xFF) shl 24) or
+                            ((payload[off + 1].toInt() and 0xFF) shl 16) or
+                            ((payload[off + 2].toInt() and 0xFF) shl 8) or
+                            (payload[off + 3].toInt() and 0xFF)
+                    off += 4
+                    val ciphertext = payload.copyOfRange(off, payload.size)
 
-                    val nonce = NonceUtils.build12ByteNonce(keys.nonceBase, sessionCounter++)
-                    val plaintext = CryptoEngine.decryptAesGcm(keys.senderToReceiverKey, nonce, ciphertext)
+                    // T3: Nonce and AAD verification from wire headers
+                    val nonce = NonceUtils.buildChunkNonce(keys.nonceBase, chunkIdx, attemptCounter)
+                    val aad = NonceUtils.buildAad(sid, fileId, chunkIdx)
+                    val plaintext = CryptoEngine.decryptAesGcm(keys.senderToReceiverKey, nonce, ciphertext, aad)
 
                     val (start, _) = ChunkPlanner.getChunkByteRange(chunkIdx, file.size, manifest.chunkSize)
                     plaintext.copyInto(fileBuffer, start.toInt())
