@@ -12,6 +12,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.security.MessageDigest
 
 class ReceiverStateMachine(
     private val scope: CoroutineScope
@@ -20,8 +21,8 @@ class ReceiverStateMachine(
     val state: StateFlow<ReceiverState> = _state.asStateFlow()
 
     private var myKeyPair: KeyPair? = null
-    private var sessionKeys: SessionKeys? = null
-    private var activeOffer: OfferMessage? = null
+    var sessionKeys: SessionKeys? = null
+    var activeOffer: OfferMessage? = null
     private var activeConnection: Connection? = null
     private val receivedFiles = mutableMapOf<String, ByteArray>()
     val completedFilesData: Map<String, ByteArray> get() = receivedFiles
@@ -84,15 +85,42 @@ class ReceiverStateMachine(
     private suspend fun runReceiveLoop(connection: Connection) {
         val keys = sessionKeys ?: throw IllegalStateException("No session keys")
         val offer = activeOffer ?: throw IllegalStateException("No active offer")
+        val sid = offer.sessionId
 
         // 1. Read Peer AUTH
         val peerAuthFrame = connection.readFrame()
-        require(peerAuthFrame.type == FrameType.AUTH) { "Expected AUTH frame" }
+        if (peerAuthFrame.type != FrameType.AUTH) {
+            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Expected AUTH frame")))
+            connection.close()
+            _state.value = ReceiverState.Failed("Expected AUTH frame, got ${peerAuthFrame.type}")
+            return
+        }
 
-        // 2. Send Receiver AUTH
-        val authTag = CryptoEngine.computeHmacSha256(keys.receiverToSenderKey, "authreceiver".encodeToByteArray())
-        val authMsg = AuthMessage(sessionId = offer.sessionId, authTag = authTag)
-        connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, authMsg))
+        val peerAuthMsg = ProtocolCodec.decodePayload<AuthMessage>(peerAuthFrame)
+
+        // Verify sessionId match
+        if (!MessageDigest.isEqual(peerAuthMsg.sessionId, sid)) {
+            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("SessionId mismatch")))
+            connection.close()
+            _state.value = ReceiverState.Failed("SessionId mismatch in AUTH")
+            return
+        }
+
+        // Verify HMAC(senderToReceiverKey, "authsender" || sessionId)
+        val expectedSenderAuthPayload = "authsender".encodeToByteArray() + sid
+        val expectedSenderTag = CryptoEngine.computeHmacSha256(keys.senderToReceiverKey, expectedSenderAuthPayload)
+        if (!MessageDigest.isEqual(peerAuthMsg.authTag, expectedSenderTag)) {
+            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("AUTH tag verification failed")))
+            connection.close()
+            _state.value = ReceiverState.Failed("AUTH tag verification failed")
+            return
+        }
+
+        // 2. Send Receiver AUTH: HMAC(receiverToSenderKey, "authreceiver" || sessionId)
+        val myAuthPayload = "authreceiver".encodeToByteArray() + sid
+        val myAuthTag = CryptoEngine.computeHmacSha256(keys.receiverToSenderKey, myAuthPayload)
+        val myAuthMsg = AuthMessage(sessionId = sid, authTag = myAuthTag)
+        connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, myAuthMsg))
 
         // 3. Read MANIFEST
         val manifestFrame = connection.readFrame()
@@ -101,7 +129,6 @@ class ReceiverStateMachine(
 
         var sessionCounter = 0
 
-        // 4. Download files sequentially
         for ((fileIdx, file) in manifest.files.withIndex()) {
             val totalChunks = ChunkPlanner.calculateTotalChunks(file.size, manifest.chunkSize)
             val bitmap = ChunkBitmap(totalChunks)
@@ -140,7 +167,6 @@ class ReceiverStateMachine(
                 }
             }
 
-            // 5. Verify integrity and notify sender
             _state.value = ReceiverState.Verifying(file.id)
             val hash = CryptoEngine.sha256(fileBuffer)
             val matches = hash.contentEquals(file.sha256)
@@ -152,7 +178,6 @@ class ReceiverStateMachine(
             receivedFiles[file.id] = fileBuffer
         }
 
-        // 6. Read DONE
         val doneFrame = connection.readFrame()
         require(doneFrame.type == FrameType.DONE) { "Expected DONE frame" }
         _state.value = ReceiverState.Done

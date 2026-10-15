@@ -11,6 +11,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.security.MessageDigest
 
 class SenderStateMachine(
     private val scope: CoroutineScope
@@ -19,8 +20,8 @@ class SenderStateMachine(
     val state: StateFlow<SenderState> = _state.asStateFlow()
 
     private var myKeyPair: KeyPair? = null
-    private var sessionKeys: SessionKeys? = null
-    private var sessionId: ByteArray? = null
+    var sessionKeys: SessionKeys? = null
+    var sessionId: ByteArray? = null
     private var filesToSend: List<FileMeta> = emptyList()
     private var fileDataMap: Map<String, ByteArray> = emptyMap()
     private var activeConnection: Connection? = null
@@ -34,7 +35,6 @@ class SenderStateMachine(
         val keyPair = CryptoEngine.generateX25519KeyPair()
         myKeyPair = keyPair
         
-        // T1: Generate cryptographically secure random 16-byte sessionId
         val sid = CryptoEngine.randomBytes(16)
         sessionId = sid
 
@@ -87,16 +87,46 @@ class SenderStateMachine(
         val keys = sessionKeys ?: throw IllegalStateException("No session keys derived")
         val sid = sessionId ?: throw IllegalStateException("No sessionId initialized")
 
-        val authTag = CryptoEngine.computeHmacSha256(keys.senderToReceiverKey, "authsender".encodeToByteArray())
-        val authMsg = AuthMessage(sessionId = sid, authTag = authTag)
-        connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, authMsg))
+        // 1. Send Sender AUTH: HMAC(senderToReceiverKey, "authsender" || sessionId)
+        val authPayload = "authsender".encodeToByteArray() + sid
+        val myAuthTag = CryptoEngine.computeHmacSha256(keys.senderToReceiverKey, authPayload)
+        val myAuthMsg = AuthMessage(sessionId = sid, authTag = myAuthTag)
+        connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, myAuthMsg))
 
+        // 2. Read and verify Peer AUTH
         val peerAuthFrame = connection.readFrame()
-        require(peerAuthFrame.type == FrameType.AUTH) { "Expected AUTH frame" }
+        if (peerAuthFrame.type != FrameType.AUTH) {
+            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Expected AUTH frame")))
+            connection.close()
+            _state.value = SenderState.Failed("Expected AUTH frame, got ${peerAuthFrame.type}")
+            return
+        }
 
+        val peerAuthMsg = ProtocolCodec.decodePayload<AuthMessage>(peerAuthFrame)
+
+        // Verify sessionId match
+        if (!MessageDigest.isEqual(peerAuthMsg.sessionId, sid)) {
+            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("SessionId mismatch")))
+            connection.close()
+            _state.value = SenderState.Failed("SessionId mismatch in AUTH")
+            return
+        }
+
+        // Verify HMAC(receiverToSenderKey, "authreceiver" || sessionId)
+        val expectedReceiverAuthPayload = "authreceiver".encodeToByteArray() + sid
+        val expectedReceiverTag = CryptoEngine.computeHmacSha256(keys.receiverToSenderKey, expectedReceiverAuthPayload)
+        if (!MessageDigest.isEqual(peerAuthMsg.authTag, expectedReceiverTag)) {
+            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("AUTH tag verification failed")))
+            connection.close()
+            _state.value = SenderState.Failed("AUTH tag verification failed")
+            return
+        }
+
+        // 3. Send MANIFEST
         val manifest = ManifestMessage(files = filesToSend)
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.MANIFEST, manifest))
 
+        // 4. Chunk exchange loop
         var completedFiles = 0
         while (completedFiles < filesToSend.size && !connection.isClosed) {
             val frame = connection.readFrame()
