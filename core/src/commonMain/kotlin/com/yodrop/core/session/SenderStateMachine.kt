@@ -33,7 +33,9 @@ class SenderStateMachine(
 
         val keyPair = CryptoEngine.generateX25519KeyPair()
         myKeyPair = keyPair
-        val sid = ByteArray(16) { (it * 7 + 13).toByte() }
+        
+        // T1: Generate cryptographically secure random 16-byte sessionId
+        val sid = CryptoEngine.randomBytes(16)
         sessionId = sid
 
         val totalBytes = files.sumOf { it.size }
@@ -85,20 +87,16 @@ class SenderStateMachine(
         val keys = sessionKeys ?: throw IllegalStateException("No session keys derived")
         val sid = sessionId ?: throw IllegalStateException("No sessionId initialized")
 
-        // 1. Send AUTH frame
         val authTag = CryptoEngine.computeHmacSha256(keys.senderToReceiverKey, "authsender".encodeToByteArray())
         val authMsg = AuthMessage(sessionId = sid, authTag = authTag)
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.AUTH, authMsg))
 
-        // 2. Read Peer AUTH
         val peerAuthFrame = connection.readFrame()
         require(peerAuthFrame.type == FrameType.AUTH) { "Expected AUTH frame" }
 
-        // 3. Send MANIFEST
         val manifest = ManifestMessage(files = filesToSend)
         connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.MANIFEST, manifest))
 
-        // 4. Handle Receiver Driven Chunk Requests
         var completedFiles = 0
         while (completedFiles < filesToSend.size && !connection.isClosed) {
             val frame = connection.readFrame()
@@ -147,7 +145,6 @@ class SenderStateMachine(
             }
         }
 
-        // 5. Transfer Complete
         connection.writeFrame(RawFrame(FrameType.DONE, ByteArray(0)))
         _state.value = SenderState.Done
     }
