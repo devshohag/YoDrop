@@ -9,9 +9,11 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 
-actual class PlatformSocket(private val socket: Socket = Socket()) {
+actual class PlatformSocket(private val socket: Socket) {
     private val outputStream: OutputStream by lazy { socket.getOutputStream() }
     private val inputStream: InputStream by lazy { socket.getInputStream() }
+
+    actual val isConnected: Boolean get() = socket.isConnected && !socket.isClosed
 
     actual suspend fun connect(host: String, port: Int) {
         withContext(Dispatchers.IO) {
@@ -50,8 +52,6 @@ actual class PlatformSocket(private val socket: Socket = Socket()) {
         }
     }
 
-    actual val isConnected: Boolean get() = socket.isConnected && !socket.isClosed
-
     private fun readFully(input: InputStream, buffer: ByteArray, length: Int) {
         var offset = 0
         while (offset < length) {
@@ -62,13 +62,13 @@ actual class PlatformSocket(private val socket: Socket = Socket()) {
     }
 }
 
-actual class PlatformServerSocket actual constructor(port: Int) {
-    private val serverSocket = ServerSocket(port)
+actual class PlatformServerSocket(private val serverSocket: ServerSocket) {
+    actual val localPort: Int get() = serverSocket.localPort
 
     actual suspend fun accept(): PlatformSocket {
         return withContext(Dispatchers.IO) {
-            val socket = serverSocket.accept()
-            PlatformSocket(socket)
+            val clientSocket = serverSocket.accept()
+            PlatformSocket(clientSocket)
         }
     }
 
@@ -77,6 +77,7 @@ actual class PlatformServerSocket actual constructor(port: Int) {
             runCatching { serverSocket.close() }
         }
     }
-
-    actual val localPort: Int get() = serverSocket.localPort
 }
+
+actual fun createPlatformSocket(): PlatformSocket = PlatformSocket(Socket())
+actual fun createPlatformServerSocket(port: Int): PlatformServerSocket = PlatformServerSocket(ServerSocket(port))

@@ -1,8 +1,9 @@
 ﻿package com.yodrop.core
 
 import com.yodrop.core.crypto.CryptoEngine
-import com.yodrop.core.platform.PlatformServerSocket
 import com.yodrop.core.platform.PlatformSocket
+import com.yodrop.core.platform.createPlatformServerSocket
+import com.yodrop.core.platform.createPlatformSocket
 import com.yodrop.core.protocol.FileMeta
 import com.yodrop.core.protocol.LinkInfoMessage
 import com.yodrop.core.protocol.LinkType
@@ -29,18 +30,16 @@ class Phase4SocketTests {
 
     @Test
     fun testRealTcpSocketTransferAndIntegrity() = runTest {
-        val server = PlatformServerSocket(0)
+        val server = createPlatformServerSocket(0)
         val port = server.localPort
 
         val sender = SenderStateMachine(this)
         val receiver = ReceiverStateMachine(this)
 
-        // 1. Generate 4 MiB real test file
         val fileContent = ByteArray(4 * 1024 * 1024) { (it % 251).toByte() }
         val sha256 = CryptoEngine.sha256(fileContent)
         val meta = FileMeta("tcp-f1", "large_video.mp4", fileContent.size.toLong(), "video/mp4", sha256)
 
-        // 2. Handshake phase
         sender.onGrabbed(listOf(meta), mapOf(meta.id to fileContent))
         val offer = (sender.state.value as SenderState.Advertising).offer
 
@@ -53,14 +52,13 @@ class Phase4SocketTests {
         val decision = receiver.acceptTransfer(linkInfo)
         sender.onDecisionReceived(decision, linkInfo)
 
-        // 3. Connect real sockets over OS network loopback
         val serverAcceptDeferred = async(Dispatchers.IO) {
             val clientSocket = server.accept()
             SocketConnectionWrapper(clientSocket)
         }
 
         val clientConnectDeferred = async(Dispatchers.IO) {
-            val sock = PlatformSocket()
+            val sock = createPlatformSocket()
             sock.connect("127.0.0.1", port)
             SocketConnectionWrapper(sock)
         }
@@ -71,7 +69,6 @@ class Phase4SocketTests {
         sender.attachConnection(serverSideConn)
         receiver.attachConnection(clientSideConn)
 
-        // 4. Await transfer complete
         withTimeout(15_000) {
             while (sender.state.value !is SenderState.Done || receiver.state.value !is ReceiverState.Done) {
                 delay(20)
@@ -81,7 +78,6 @@ class Phase4SocketTests {
         assertEquals(SenderState.Done, sender.state.value)
         assertEquals(ReceiverState.Done, receiver.state.value)
 
-        // 5. Verify bit-exact integrity
         val receivedBytes = receiver.completedFilesData[meta.id]
         assertTrue(receivedBytes != null && fileContent.contentEquals(receivedBytes))
 
