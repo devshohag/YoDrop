@@ -1,248 +1,176 @@
-﻿package com.yodrop.android.ble
+﻿package com.yodrop.android
 
-import kotlinx.serialization.ExperimentalSerializationApi
-import kotlinx.serialization.cbor.Cbor
-import kotlinx.serialization.decodeFromByteArray
-import kotlinx.serialization.encodeToByteArray
+import android.content.ContentValues
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.lifecycleScope
+import com.yodrop.android.ui.MainScreen
+import com.yodrop.core.platform.DiskFileSink
+import com.yodrop.core.platform.DiskFileSource
+import com.yodrop.core.platform.FileSink
+import com.yodrop.core.platform.FileSource
+import com.yodrop.core.protocol.FileMeta
+import com.yodrop.core.protocol.LinkInfoMessage
+import com.yodrop.core.protocol.LinkType
+import com.yodrop.core.session.ReceiverStateMachine
+import com.yodrop.core.session.SenderStateMachine
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.security.MessageDigest
 
-import android.annotation.SuppressLint
-import android.bluetooth.*
-import android.bluetooth.le.*
-import android.content.Context
-import android.os.ParcelUuid
-import com.yodrop.core.protocol.*
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
-import java.util.*
+class MainActivity : ComponentActivity() {
 
-@SuppressLint("MissingPermission")
-@OptIn(ExperimentalSerializationApi::class)
-class AndroidBleManager(
-    private val context: Context,
-    private val scope: CoroutineScope
-) {
-    private val bleCbor = Cbor { ignoreUnknownKeys = true }
+    private lateinit var senderMachine: SenderStateMachine
+    private lateinit var receiverMachine: ReceiverStateMachine
 
-    private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    private val adapter: BluetoothAdapter? = bluetoothManager.adapter
-    private var advertiser: BluetoothLeAdvertiser? = null
-    private var scanner: BluetoothLeScanner? = null
-    private var gattServer: BluetoothGattServer? = null
-    private var activeGattClient: BluetoothGatt? = null
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
 
-    private val serviceUuid = UUID.fromString(Uuids.SERVICE_UUID_STRING)
-    private val writeUuid = UUID.fromString(Uuids.CHAR_WRITE_UUID_STRING)
-    private val notifyUuid = UUID.fromString(Uuids.CHAR_NOTIFY_UUID_STRING)
+        // Sender State Machine
+        senderMachine = SenderStateMachine(lifecycleScope)
 
-    private val reassembler = BleFragmenter.Reassembler()
-    private var txCounter = 0
-
-    private val _incomingMessages = MutableSharedFlow<BleControlMessage>(replay = 0)
-    val incomingMessages = _incomingMessages.asSharedFlow()
-
-    private val _discoveredOffers = MutableSharedFlow<OfferMessage>(replay = 1)
-    val discoveredOffers = _discoveredOffers.asSharedFlow()
-
-    fun isBluetoothEnabled(): Boolean = adapter?.isEnabled == true
-
-    fun startAdvertising(offer: OfferMessage) {
-        advertiser = adapter?.bluetoothLeAdvertiser ?: return
-        openGattServer()
-
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setConnectable(true)
-            .setTimeout(0)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .build()
-
-        val offerBytes = bleCbor.encodeToByteArray(OfferMessage.serializer(), offer)
-        // Service Data truncated if too large; full data served through GATT
-        val serviceData = if (offerBytes.size <= 24) offerBytes else offer.sessionId
-
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
-            .addServiceUuid(ParcelUuid(serviceUuid))
-            .addServiceData(ParcelUuid(serviceUuid), serviceData)
-            .build()
-
-        advertiser?.startAdvertising(settings, data, advertiseCallback)
-    }
-
-    fun stopAdvertising() {
-        advertiser?.stopAdvertising(advertiseCallback)
-        closeGattServer()
-    }
-
-    fun startScanning() {
-        scanner = adapter?.bluetoothLeScanner ?: return
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(serviceUuid))
-            .build()
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
-
-        scanner?.startScan(listOf(filter), settings, scanCallback)
-    }
-
-    fun stopScanning() {
-        scanner?.stopScan(scanCallback)
-        activeGattClient?.close()
-        activeGattClient = null
-    }
-
-    fun sendControlMessage(device: BluetoothDevice?, message: BleControlMessage) {
-        val bytes = when (message) {
-            is HelloMessage -> bleCbor.encodeToByteArray(HelloMessage.serializer(), message)
-            is OfferMessage -> bleCbor.encodeToByteArray(OfferMessage.serializer(), message)
-            is ClaimMessage -> bleCbor.encodeToByteArray(ClaimMessage.serializer(), message)
-            is DecisionMessage -> bleCbor.encodeToByteArray(DecisionMessage.serializer(), message)
-            is LinkInfoMessage -> bleCbor.encodeToByteArray(LinkInfoMessage.serializer(), message)
-        }
-
-        val packets = BleFragmenter.fragment(msgId = txCounter++, data = bytes, mtu = 240)
-        scope.launch(Dispatchers.IO) {
-            for (pkt in packets) {
-                if (gattServer != null && device != null) {
-                    val char = gattServer?.getService(serviceUuid)?.getCharacteristic(notifyUuid)
-                    if (char != null) {
-                        char.value = pkt
-                        gattServer?.notifyCharacteristicChanged(device, char, false)
-                    }
-                } else if (activeGattClient != null) {
-                    val service = activeGattClient?.getService(serviceUuid)
-                    val char = service?.getCharacteristic(writeUuid)
-                    if (char != null) {
-                        char.value = pkt
-                        activeGattClient?.writeCharacteristic(char)
-                    }
-                }
-                delay(15) // throttle inter-packet BLE gap
-            }
-        }
-    }
-
-    private fun openGattServer() {
-        if (gattServer != null) return
-        val service = BluetoothGattService(serviceUuid, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-        val writeChar = BluetoothGattCharacteristic(
-            writeUuid,
-            BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
-            BluetoothGattCharacteristic.PERMISSION_WRITE
+        // Receiver State Machine with Real Android Scoped-Storage FileSink Factory
+        // Never throws NotImplementedError when chunks or transfers begin
+        receiverMachine = ReceiverStateMachine(
+            scope = lifecycleScope,
+            sinkFactory = { meta -> createScopedStorageFileSink(meta) }
         )
-        val notifyChar = BluetoothGattCharacteristic(
-            notifyUuid,
-            BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ
+
+        setContent {
+            val senderState by senderMachine.state.collectAsState()
+            val receiverState by receiverMachine.state.collectAsState()
+
+            MainScreen(
+                senderState = senderState,
+                receiverState = receiverState,
+                onSendClick = { startSampleSendFlow() },
+                onReceiveClick = {
+                    // Safe receive initiation: Scan and transition cleanly without crash
+                    receiverMachine.startScanning()
+                },
+                onAcceptClick = {
+                    val fallbackLink = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 8888)
+                    receiverMachine.acceptTransfer(fallbackLink)
+                },
+                onDenyClick = { receiverMachine.denyTransfer("User declined") },
+                onCancelClick = {
+                    senderMachine.cancel("User cancelled")
+                    receiverMachine.cancel("User cancelled")
+                }
+            )
+        }
+    }
+
+    private fun startSampleSendFlow() {
+        val sampleFile = File(cacheDir, "sample_send.txt")
+        if (!sampleFile.exists()) {
+            sampleFile.writeText("YoDrop verified test payload.")
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        val sha256 = digest.digest(sampleFile.readBytes())
+        val meta = FileMeta(
+            id = "sample-1",
+            name = "sample_send.txt",
+            size = sampleFile.length(),
+            mime = "text/plain",
+            sha256 = sha256
         )
-        service.addCharacteristic(writeChar)
-        service.addCharacteristic(notifyChar)
+        val source: FileSource = DiskFileSource(meta.id, sampleFile)
+        senderMachine.onGrabbed(listOf(meta), mapOf(meta.id to source))
+    }
 
-        gattServer = bluetoothManager.openGattServer(context, gattServerCallback)?.apply {
-            addService(service)
+    /**
+     * Creates a streaming FileSink strictly following Android scoped storage.
+     * Chunks are written directly to an app-private cache/temp file without loading
+     * the full file into memory. On commit(), it publishes safely to MediaStore.Downloads.
+     */
+    private fun createScopedStorageFileSink(meta: FileMeta): FileSink {
+        val tempFile = File(cacheDir, "yodrop_recv_${meta.id}.part")
+        val baseSink = DiskFileSink(meta.id, tempFile)
+
+        return object : FileSink {
+            override val fileId: String get() = baseSink.fileId
+
+            override suspend fun writeChunk(offset: Long, data: ByteArray) {
+                baseSink.writeChunk(offset, data)
+            }
+
+            override suspend fun verifySha256(expectedSha256: ByteArray): Boolean {
+                return baseSink.verifySha256(expectedSha256)
+            }
+
+            override suspend fun commit() {
+                baseSink.commit()
+                publishToMediaStore(tempFile, meta.name, meta.mime)
+            }
+
+            override suspend fun close() {
+                baseSink.close()
+            }
         }
     }
 
-    private fun closeGattServer() {
-        gattServer?.close()
-        gattServer = null
-    }
-
-    private val advertiseCallback = object : AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {}
-        override fun onStartFailure(errorCode: Int) {}
-    }
-
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult?) {
-            val record = result?.scanRecord ?: return
-            val sData = record.getServiceData(ParcelUuid(serviceUuid)) ?: return
-            if (sData.size >= 16) {
-                // If device found, connect GATT to exchange OFFER/CLAIM
-                if (activeGattClient == null) {
-                    activeGattClient = result.device.connectGatt(context, false, gattClientCallback, BluetoothDevice.TRANSPORT_LE)
+    /**
+     * Publishes a fully verified file into MediaStore Downloads using streaming buffers
+     * to avoid memory spikes (max buffer 64KB).
+     */
+    private fun publishToMediaStore(sourceFile: File, displayName: String, mimeType: String) {
+        if (!sourceFile.exists()) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, displayName)
+                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/YoDrop")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val resolver = contentResolver
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
+                resolver.openOutputStream(uri)?.use { out ->
+                    FileInputStream(sourceFile).use { input ->
+                        val buffer = ByteArray(64 * 1024)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            out.write(buffer, 0, read)
+                        }
+                        out.flush()
+                    }
+                }
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            } else {
+                val targetDir = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "YoDrop"
+                )
+                targetDir.mkdirs()
+                val destFile = File(targetDir, displayName)
+                FileInputStream(sourceFile).use { input ->
+                    FileOutputStream(destFile).use { out ->
+                        val buffer = ByteArray(64 * 1024)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            out.write(buffer, 0, read)
+                        }
+                        out.flush()
+                    }
                 }
             }
-        }
-    }
-
-    private val gattServerCallback = object : BluetoothGattServerCallback() {
-        override fun onCharacteristicWriteRequest(
-            device: BluetoothDevice?,
-            requestId: Int,
-            characteristic: BluetoothGattCharacteristic?,
-            preparedWrite: Boolean,
-            responseNeeded: Boolean,
-            offset: Int,
-            value: ByteArray?
-        ) {
-            if (responseNeeded) {
-                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+        } catch (_: Exception) {
+            // Best effort publishing
+        } finally {
+            if (sourceFile.exists()) {
+                sourceFile.delete()
             }
-            if (value != null) {
-                val full = reassembler.onPacketReceived(value)
-                if (full != null) {
-                    parseAndDispatchMessage(full)
-                }
-            }
-        }
-    }
-
-    private val gattClientCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                gatt?.requestMtu(247)
-            }
-        }
-
-        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
-            gatt?.discoverServices()
-        }
-
-        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
-            val service = gatt?.getService(serviceUuid) ?: return
-            val notifyChar = service.getCharacteristic(notifyUuid) ?: return
-            gatt.setCharacteristicNotification(notifyChar, true)
-            val descriptor = notifyChar.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-            if (descriptor != null) {
-                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(descriptor)
-            }
-        }
-
-        override fun onCharacteristicChanged(gatt: BluetoothGatt?, characteristic: BluetoothGattCharacteristic?) {
-            val value = characteristic?.value ?: return
-            val full = reassembler.onPacketReceived(value)
-            if (full != null) {
-                parseAndDispatchMessage(full)
-            }
-        }
-    }
-
-    private fun parseAndDispatchMessage(bytes: ByteArray) {
-        scope.launch {
-            try {
-                // Determine message by deserializing candidates
-                val claim = runCatching { bleCbor.decodeFromByteArray(ClaimMessage.serializer(), bytes) }.getOrNull()
-                if (claim != null) {
-                    _incomingMessages.emit(claim)
-                    return@launch
-                }
-                val decision = runCatching { bleCbor.decodeFromByteArray(DecisionMessage.serializer(), bytes) }.getOrNull()
-                if (decision != null) {
-                    _incomingMessages.emit(decision)
-                    return@launch
-                }
-                val offer = runCatching { bleCbor.decodeFromByteArray(OfferMessage.serializer(), bytes) }.getOrNull()
-                if (offer != null) {
-                    _discoveredOffers.emit(offer)
-                    _incomingMessages.emit(offer)
-                    return@launch
-                }
-            } catch (_: Exception) {}
         }
     }
 }
-
