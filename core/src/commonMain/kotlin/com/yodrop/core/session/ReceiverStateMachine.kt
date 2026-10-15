@@ -120,6 +120,16 @@ class ReceiverStateMachine(
         val manifestFrame = connection.readFrame()
         require(manifestFrame.type == FrameType.MANIFEST) { "Expected MANIFEST frame" }
         val manifest = ProtocolCodec.decodePayload<ManifestMessage>(manifestFrame)
+        
+        // T4: Enforce manifest bounds and name sanitization
+        try {
+            manifest.validate()
+        } catch (e: Exception) {
+            connection.writeFrame(ProtocolCodec.encodeToFrame(FrameType.CANCEL, CancelMessage("Invalid manifest: ${e.message}")))
+            connection.close()
+            _state.value = ReceiverState.Failed("Invalid manifest: ${e.message}")
+            return
+        }
 
         for ((fileIdx, file) in manifest.files.withIndex()) {
             val totalChunks = ChunkPlanner.calculateTotalChunks(file.size, manifest.chunkSize)
@@ -153,7 +163,6 @@ class ReceiverStateMachine(
                     off += 4
                     val ciphertext = payload.copyOfRange(off, payload.size)
 
-                    // T3: Nonce and AAD verification from wire headers
                     val nonce = NonceUtils.buildChunkNonce(keys.nonceBase, chunkIdx, attemptCounter)
                     val aad = NonceUtils.buildAad(sid, fileId, chunkIdx)
                     val plaintext = CryptoEngine.decryptAesGcm(keys.senderToReceiverKey, nonce, ciphertext, aad)

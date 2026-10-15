@@ -29,3 +29,16 @@
 - **Associated Authenticated Data (AAD)**:
   - `AAD = sessionId (16B) || fileId (UTF-8) || u32(chunkIndex)`.
   - Prevents chunk swapping, replay from different files, or tampering with the plain chunkIndex header.
+
+## [T4] Untrusted Length Bounding & Manifest Sanitization
+- **Decision**: Strict upper and lower bounds on all network frame allocations.
+- **Frame Caps**:
+  - `MAX_FRAME_SIZE = 4 * 1024 * 1024 + 1024` (4 MiB payload + 1 KiB overhead).
+  - Any frame with `length < 1` or `length > MAX_FRAME_SIZE` immediately raises an error and terminates the socket connection.
+- **Zero-Copy Frame Assembly**:
+  - Network bytes are read directly into the final `payload` buffer without concatenating `lenBuf + frameBuf`.
+- **Manifest Sanitization**:
+  - Manifest file sizes must be strictly non-negative (`size >= 0`).
+  - File count capped at 1,000 files per manifest.
+  - Chunk size must be between 64 KiB and 8 MiB.
+  - File names are sanitized against path traversal (`..`, `/`, `\`) and ASCII control characters.

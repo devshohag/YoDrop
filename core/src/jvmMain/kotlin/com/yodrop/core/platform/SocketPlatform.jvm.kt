@@ -47,11 +47,22 @@ actual class PlatformSocket(private val socket: Socket) {
                     ((lenBuf[2].toInt() and 0xFF) shl 8) or
                     (lenBuf[3].toInt() and 0xFF)
 
-            val frameBuf = ByteArray(length)
-            readFully(inputStream, frameBuf, length)
+            // Bound check to prevent allocation of malicious/negative sizes
+            if (length !in RawFrame.MIN_FRAME_SIZE..RawFrame.MAX_FRAME_SIZE) {
+                socket.close()
+                throw IllegalArgumentException("Untrusted frame length $length rejected (exceeds cap${RawFrame.MAX_FRAME_SIZE})")
+            }
 
-            val fullPacket = lenBuf + frameBuf
-            RawFrame.decode(fullPacket)
+            val typeByte = inputStream.read()
+            if (typeByte == -1) throw IllegalStateException("Socket stream closed while reading frame type")
+
+            val payloadLength = length - 1
+            val payload = ByteArray(payloadLength)
+            if (payloadLength > 0) {
+                readFully(inputStream, payload, payloadLength)
+            }
+
+            RawFrame(typeByte.toByte(), payload)
         }
     }
 
