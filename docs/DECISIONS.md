@@ -1,6 +1,6 @@
 # Current implementation decisions
 
-This file describes the current tree, audited at Step 20 and extended by P6/R1. Historical intermediate
+This file describes the current tree, audited at Step 20 and extended by P6/R1/R2. Historical intermediate
 notes remain available in git (`git show 4fb3bd4:docs/DECISIONS.md`) and the older
 STEP*-VALIDATION reports; their pending-work statements are not current status.
 Physical results are recorded separately in MANUAL-TESTS.md and the Step 20 device
@@ -334,3 +334,39 @@ fragmentation, counters, registry persistence/failure, receive-window races,
 first-pair/reconnect/key-change/revocation/legacy behavior and authenticated consent
 through real TCP. Android Keystore/BLE/lifecycle evidence remains physical work;
 R1-VALIDATION.md records commands and pending checks without upgrading old results.
+
+## R2 — Preview, Grab and selected trusted Catch (A6 continuation)
+
+Owner requested redesign Phase 2 on R1 commit c732663. One Select files entry now
+always stages a preview: filenames, MIME, sizes, batch summary and a bounded
+provider thumbnail where available. Grab gesture/tap is the sole handoff into
+existing advertising and streaming transfer ownership. Cancel/destruction before
+handoff releases prepared sources; no selection is restored after recreation.
+
+The known-device path starts by selecting a pinned sender on the home screen.
+Camera/radio prompts resolve first; a 60-second foreground R1 window then opens.
+The controller's Android-enabled autoClaimTrustedOffers option reads/disconnects/
+reconnects and CLAIMs an offer without another tap. It authenticates the exact
+selected P-256 identity and reads encrypted details before exposing Catch. The
+option defaults off for legacy callers. An unrelated first discovered device
+fails closed; this phase does not add multi-device selection on public BLE data.
+
+A Catch ticket binds fingerprint, window token and ephemeral session token. Only
+a fresh stable fist->palm after authentication (new CATCH mode), or its Catch files
+tap fallback, submits encrypted consent through the existing R1 channel. Core
+rechecks the live proof, pin, prompt and monotonic window under its mutex, and
+consumes once. No endpoint is created merely by CLAIM/identity verification.
+Stale/forged/replayed Catch commands, expiry, backgrounding and revoked/unavailable
+trust cannot authorize. Runtime also rechecks the UI lease after a potentially
+suspending registry lookup/discovery start, so a delayed launch cannot reopen
+receiving in the background. An expired trusted session never offers manual Accept
+as a fallback. Ordinary Receive, unknown/legacy identities and trust enrolled in
+the current manual prompt still use explicit Accept.
+
+Compose uses a dark navy/mint theme, native drawn waiting/progress/completion art,
+a 112x144 camera preview with pose instructions, explicit camera-off control and
+48dp+ tap targets. No new dependency, protocol field, SDK bump, global temp change,
+whole-file buffering or change to MediaStore/resume/TCP crypto was introduced.
+Animations do not authorize. Actual UI rendering, camera accuracy, permission/
+rotation behavior and two-phone transfers remain pending in R3; source compilation
+and loopback tests alone are not physical acceptance.

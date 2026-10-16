@@ -2,6 +2,11 @@
 
 Do not infer any physical Android result from JVM tests or an APK build.
 
+For the current Android preview/Grab/Catch redesign, follow
+[R2 validation and the R3 device checklist](R2-VALIDATION.md). All listed physical
+checks remain pending until measured on the rebuilt apps; R1 enrollment rules
+continue to apply.
+
 ## Step 20 acceptance gate and result recording
 
 As of the Step 20 audit, **no physical result has been supplied**. All previous

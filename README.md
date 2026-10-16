@@ -11,9 +11,16 @@ acceptance is still pending; see [P6 validation](docs/P6-VALIDATION.md).
 
 Android redesign **R1** adds signed device identities, owner-confirmed trust and
 60-second receiving from one selected trusted sender. Initial trust compares a
-full pairing code on both phones; every transfer still needs Accept in R1.
-See [R1 validation](docs/R1-VALIDATION.md). The preview/grab/catch consent UI is R2,
-and two-phone acceptance/fixes are R3. Group mode remains P10.
+full pairing code on both phones; every transfer still needed Accept in R1.
+See [R1 validation](docs/R1-VALIDATION.md).
+
+Android redesign **R2** adds the new preview -> Grab -> Catch UI, optional compact
+camera, provider thumbnails, waiting/progress/delivery animation and tap fallback.
+Choose a trusted sender under **Get ready to Catch**: after identity verification,
+a fresh fist->palm or **Catch files** tap consents without a separate Accept.
+Unknown devices and ordinary Receive keep explicit code comparison/Accept. No
+files are accepted automatically. See [R2 validation](docs/R2-VALIDATION.md).
+Two-phone visual/gesture/radio acceptance and fixes are R3. Group remains P10.
 
 The iOS app, Android-to-iOS transfer, Share Sheet/group mode and BLE-only small-
 payload data are future P7-P10 work. `ios/` is a placeholder, and
@@ -26,7 +33,7 @@ See [architecture](docs/ARCHITECTURE.md), [current decisions](docs/DECISIONS.md)
 Windows validation (JDK 17 + Android SDK required):
 
 ```powershell
-& .\scripts\validate-r1.ps1 -TempDirectory D:\Temp
+& .\scripts\validate-r2.ps1 -TempDirectory D:\Temp
 ```
 
 Model preparation downloads the pinned 7.5 MiB official hand model once, verifies
@@ -38,7 +45,7 @@ dependencies; details and modifications are in [third-party notes](docs/P6-THIRD
 The validation script runs source/merged manifest checks, a clean core test + Android debug build
 and assembles the API 29 crypto instrumentation APK. Logs, test totals and APK
 hashes are retained under `build/reports/step20/`; the R1 summary is under
-`build/reports/r1/`. Neither report claims device tests.
+`build/reports/r1/`, and R2 under `build/reports/r2/`. These reports do not claim device tests.
 Install the new app APK on **both peers**: Step 20 restores the architecture's
 8-byte-prefix TCP chunk nonce layout and is incompatible with older chunk crypto.
 

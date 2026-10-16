@@ -95,7 +95,8 @@ class TransferRuntime private constructor(context: Context) {
             prepareLink = { _, choice -> senderLink.prepare(choice) }, helloSnapshot = snapshot,
             onOfferRead = { peer, offer -> ble.offerRead(peer, offer) },
             connectForClaim = { peer, offer -> ble.connectForClaim(peer, offer) },
-            onLinkReady = { receiverLink.prepare(it) }, trustedPairing = trustedPairing) { peer, message -> ble.sendControlMessage(peer, message) }
+            onLinkReady = { receiverLink.prepare(it) }, trustedPairing = trustedPairing,
+            autoClaimTrustedOffers = true) { peer, message -> ble.sendControlMessage(peer, message) }
         scope.launch {
             ble.incomingMessages.collect {
                 try { handshake.onMessage(it) }
@@ -172,6 +173,11 @@ class TransferRuntime private constructor(context: Context) {
         sender.cancel(reason); receiver.cancel(reason); ble.close()
     }
     fun onUiResumed(lease: String) { visibleUi = lease }
+    suspend fun catchTransfer(ticket: TrustedCatchTicket, lease: String) {
+        if (visibleUi != lease) return
+        if (handshake.catchTransfer(ticket)) feedback.grabbed()
+        else _alerts.emit("Catch expired. Open a new receive window and try again.")
+    }
     fun onUiPaused(lease: String) {
         if (visibleUi != lease) return
         visibleUi = null
@@ -185,11 +191,17 @@ class TransferRuntime private constructor(context: Context) {
         }
     }
     suspend fun startTrustedReceiving(fingerprint: String) {
-        if (visibleUi == null || sender.state.value !is SenderState.Idle || receiver.state.value !is ReceiverState.Idle || trustedDevices.find(fingerprint) == null) return
+        val lease = visibleUi ?: return
+        if (sender.state.value !is SenderState.Idle || receiver.state.value !is ReceiverState.Idle || trustedDevices.find(fingerprint) == null) return
+        // The registry mutex may have waited for a storage write while the UI was paused.
+        if (visibleUi != lease) return
         val window = trustedPairing.armReceive(fingerprint)
         trustedWindowToken = window.token
         try {
             startReceiving()
+            if (visibleUi != lease || !trustedPairing.receiveWindow.isLive(window)) {
+                cancel("Trusted receive closed before discovery started"); return
+            }
             trustedWindowTimer?.cancel()
             trustedWindowTimer = scope.launch {
                 while (trustedPairing.receiveWindow.state.value?.token == window.token) {

@@ -1,6 +1,6 @@
 package com.yodrop.core.gesture
 
-enum class GestureMode { OFF, OBSERVE, PRACTICE, SEND, CLAIM }
+enum class GestureMode { OFF, OBSERVE, PRACTICE, SEND, CLAIM, CATCH }
 enum class GestureAction { GRAB, RELEASE }
 data class GestureContext(val mode: GestureMode, val token: String = "")
 data class GestureCommand(val context: GestureContext, val action: GestureAction)
@@ -57,7 +57,7 @@ class GestureGate(
         if (consumed || (emittedAt >= 0 && timestampMs - emittedAt < cooldownMs)) return null
         val allowed = context.mode == GestureMode.PRACTICE ||
             (context.mode == GestureMode.SEND && action == GestureAction.GRAB) ||
-            (context.mode == GestureMode.CLAIM && action == GestureAction.RELEASE)
+            ((context.mode == GestureMode.CLAIM || context.mode == GestureMode.CATCH) && action == GestureAction.RELEASE)
         if (!allowed) return null
         emittedAt = timestampMs
         if (context.mode != GestureMode.PRACTICE) consumed = true

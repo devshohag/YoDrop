@@ -1,5 +1,7 @@
 package com.yodrop.android.ui
 
+import android.net.Uri
+import android.text.format.Formatter
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -7,207 +9,213 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.yodrop.core.session.ReceiverState
-import com.yodrop.core.session.SenderState
+import com.yodrop.core.protocol.FileMeta
+import com.yodrop.core.session.*
+import com.yodrop.core.trust.*
+
+private val AirColors = darkColorScheme(
+    primary = Color(0xFF8AF0C7), onPrimary = Color(0xFF07382A),
+    secondary = Color(0xFFAFC6FF), background = Color(0xFF10151F),
+    surface = Color(0xFF19222F), surfaceVariant = Color(0xFF253143),
+    onBackground = Color(0xFFF3F6FC), onSurface = Color(0xFFF3F6FC),
+    onSurfaceVariant = Color(0xFFB7C4D6)
+)
 
 @Composable
 fun MainScreen(
-    senderState: SenderState,
-    receiverState: ReceiverState,
-    onSendClick: () -> Unit,
-    onClaimClick: () -> Unit,
-    peerName: String?,
-    onReceiveClick: () -> Unit,
-    onAcceptClick: () -> Unit,
-    onDenyClick: () -> Unit,
-    onCancelClick: () -> Unit,
-    preparingFiles: Boolean = false,
-    gestureSendingReady: Boolean = false,
-    gestureFileSummary: String = "",
-    practicingGestures: Boolean = false,
-    onGestureSendClick: () -> Unit = {},
-    onSendPreparedClick: () -> Unit = {},
-    onPracticeClick: () -> Unit = {},
-    onReceiverGestureClick: () -> Unit = {},
-    gesturePanel: @Composable () -> Unit = {},
-    trustPanel: @Composable () -> Unit = {},
+    senderState: SenderState, receiverState: ReceiverState,
+    onSendClick: () -> Unit, onClaimClick: () -> Unit, peerName: String?,
+    onReceiveClick: () -> Unit, onAcceptClick: () -> Unit, onDenyClick: () -> Unit,
+    onCancelClick: () -> Unit, preparingFiles: Boolean = false,
+    preparedFiles: List<FileMeta> = emptyList(), previewUri: Uri? = null,
+    catchTicket: TrustedCatchTicket? = null, trustedWindow: ReceiveWindow? = null,
+    trustedSession: Boolean = false,
+    peerIdentity: PeerIdentityStatus? = null, cameraEnabled: Boolean = false,
+    practicingGestures: Boolean = false, onSendPreparedClick: () -> Unit = {},
+    onPracticeClick: () -> Unit = {}, onCameraToggle: () -> Unit = {}, onCatchClick: () -> Unit = {},
+    gesturePanel: @Composable () -> Unit = {}, trustPanel: @Composable () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            text = "YoDrop",
-            style = MaterialTheme.typography.headlineLarge,
-            modifier = Modifier.padding(bottom = 32.dp)
-        )
-
-        gesturePanel()
-        trustPanel()
-
-        when {
-            practicingGestures -> {
-                Text("Practice only: no files are sent and no receiver is claimed.")
-                OutlinedButton(onClick = onCancelClick) { Text("Close practice") }
-            }
-            preparingFiles -> {
-                CircularProgressIndicator()
-                Text("Preparing selected files...", modifier = Modifier.padding(top = 16.dp))
-                OutlinedButton(onClick = onCancelClick) { Text("Cancel") }
-            }
-            gestureSendingReady -> {
-                Text(gestureFileSummary)
-                Text("Open palm, then fist to start sending. You can also tap Send now.")
-                Button(onClick = onSendPreparedClick) { Text("Send now") }
-                OutlinedButton(onClick = onCancelClick) { Text("Cancel selected files") }
-            }
-            senderState is SenderState.Idle && receiverState is ReceiverState.Idle -> {
-                Button(
-                    onClick = onSendClick,
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
-                ) {
-                    Text("Send Files")
+    val context = LocalContext.current
+    fun summary(count: Int, bytes: Long) = "$count file${if (count == 1) "" else "s"} · ${Formatter.formatShortFileSize(context, bytes)}"
+    val transfer = senderState as? SenderState.Transferring
+    val receiving = receiverState as? ReceiverState.Receiving
+    val progress = transfer?.progress ?: receiving?.progress
+    val done = senderState is SenderState.Done || receiverState is ReceiverState.Done
+    val waiting = senderState is SenderState.Grabbed || senderState is SenderState.AwaitAccept ||
+        receiverState is ReceiverState.Scanning || receiverState is ReceiverState.Claimed ||
+        senderState is SenderState.Linking || receiverState is ReceiverState.Linking
+    MaterialTheme(colorScheme = AirColors) {
+        Surface(modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Column(
+                Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
+                    .verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("YoDrop", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.weight(1f))
+                    Text("NEARBY · OFFLINE", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                 }
-                OutlinedButton(onClick = onGestureSendClick, modifier = Modifier.fillMaxWidth()) { Text("Send with gesture") }
-                OutlinedButton(
-                    onClick = onReceiveClick,
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
-                ) {
-                    Text("Receive")
-                }
-                TextButton(onClick = onPracticeClick) { Text("Try gestures (one phone)") }
-            }
-
-            receiverState is ReceiverState.Scanning -> {
-                Text("Waiting for an offer...")
-                TextButton(onClick = onReceiverGestureClick) { Text("Use hand gesture") }
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Cancel")
-                }
-            }
-            receiverState is ReceiverState.OfferSeen -> {
-                Text("From: ${peerName ?: "Nearby device"}")
-                Text("${receiverState.offer.fileCount} file(s), ${receiverState.offer.totalBytes} bytes")
-                TextButton(onClick = onReceiverGestureClick) { Text("Use hand gesture") }
-                Button(onClick = onClaimClick, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Receive this file")
-                }
-                OutlinedButton(onClick = onCancelClick) { Text("Cancel") }
-            }
-
-            receiverState is ReceiverState.Claimed -> {
-                CircularProgressIndicator()
-                Text("Reading encrypted file details...")
-                Button(onClick = onCancelClick) { Text("Cancel") }
-            }
-
-            senderState is SenderState.Grabbed -> {
-                CircularProgressIndicator()
-                Text("Advertising... Waiting for receiver", modifier = Modifier.padding(top = 16.dp))
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Cancel")
-                }
-            }
-
-            senderState is SenderState.AwaitAccept -> {
-                Text("Verification Code:")
-                Text(
-                    text = senderState.verifyCode,
-                    style = MaterialTheme.typography.displayMedium,
-                    modifier = Modifier.padding(vertical = 16.dp)
-                )
-                Text("Compare code with receiver and wait for acceptance.")
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Cancel")
-                }
-            }
-
-            receiverState is ReceiverState.AcceptPrompt -> {
-                Text("From: ${peerName ?: "Nearby device"}")
-                Text("Incoming file: ${receiverState.previewName}")
-                Text("${receiverState.offer.fileCount} file(s), ${receiverState.offer.totalBytes} bytes")
-                Text("Save to Downloads/YoDrop")
-                Text(
-                    text = receiverState.verifyCode,
-                    style = MaterialTheme.typography.displayMedium,
-                    modifier = Modifier.padding(vertical = 16.dp)
-                )
-                Text("Does this code match the sender?")
-                Row(
-                    modifier = Modifier.padding(top = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(onClick = onAcceptClick) {
-                        Text("Accept")
+                AirTransferVisual(waiting, progress, done, catchTicket != null)
+                when {
+                    practicingGestures -> {
+                        Heading("Try a Grab. Try a Catch.", "Practice only. No files are sent.")
+                        gesturePanel()
+                        SecondaryAction("Close practice", onCancelClick)
                     }
-                    OutlinedButton(onClick = onDenyClick) {
-                        Text("Deny")
+                    preparingFiles -> {
+                        Heading("Preparing your preview", "Checking selected files. Large files can take a moment.")
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                        SecondaryAction("Cancel", onCancelClick)
+                    }
+                    preparedFiles.isNotEmpty() -> {
+                        Heading("Ready to Grab", "Open your palm, then close it to hold these files for a nearby receiver.")
+                        FilePreviewCard(preparedFiles, previewUri)
+                        gesturePanel()
+                        PrimaryAction("Grab files", onSendPreparedClick)
+                        CameraChoice(cameraEnabled, onCameraToggle)
+                        SecondaryAction("Discard selection", onCancelClick)
+                    }
+                    senderState is SenderState.Idle && receiverState is ReceiverState.Idle -> {
+                        Heading("A little closer.\nA lot simpler.", "Preview your files, Grab to share, and Catch on the other phone.")
+                        PrimaryAction("Select files", onSendClick)
+                        SecondaryAction("Receive from a new device", onReceiveClick)
+                        Text("No internet needed. Keep Bluetooth and Wi-Fi on.", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        trustPanel()
+                        TextButton(onClick = onPracticeClick) { Text("Try gestures with one phone") }
+                    }
+                    receiverState is ReceiverState.Scanning -> {
+                        Heading(if (trustedWindow != null) "Waiting for your sender" else "Looking nearby",
+                            if (trustedWindow != null) "Ask the sender to Grab their selected files. Their identity is checked before Catch appears."
+                            else "The other phone should select files and tap or gesture Grab.")
+                        gesturePanel()
+                        CameraChoice(cameraEnabled, onCameraToggle)
+                        trustPanel()
+                        SecondaryAction("Cancel", onCancelClick)
+                    }
+                    receiverState is ReceiverState.OfferSeen -> {
+                        Heading(if (trustedWindow != null) "Checking the sender" else "An offer is nearby", "${peerName ?: "Nearby device"} · ${summary(receiverState.offer.fileCount, receiverState.offer.totalBytes)}")
+                        if (trustedWindow == null) {
+                            Text("File details stay private until you connect.", style = MaterialTheme.typography.bodySmall)
+                            gesturePanel()
+                            PrimaryAction("Review this offer", onClaimClick)
+                            CameraChoice(cameraEnabled, onCameraToggle)
+                        }
+                        trustPanel()
+                        SecondaryAction("Cancel", onCancelClick)
+                    }
+                    receiverState is ReceiverState.Claimed -> {
+                        Heading("Checking the sender", "Reading their signed identity and encrypted file preview. Nothing is accepted yet.")
+                        gesturePanel()
+                        trustPanel()
+                        SecondaryAction("Cancel", onCancelClick)
+                    }
+                    senderState is SenderState.Grabbed -> {
+                        Heading("You've got it", "Your files are ready in the air. On the other phone, choose you under trusted devices and Catch.")
+                        Text("First time? Use Receive from a new device on the other phone.", style = MaterialTheme.typography.bodySmall)
+                        SecondaryAction("Cancel sending", onCancelClick)
+                    }
+                    senderState is SenderState.AwaitAccept -> {
+                        Heading("Waiting for their Catch", if (peerIdentity?.trusted == true) "${peerIdentity.label} · identity verified"
+                            else "${peerName ?: "Nearby device"} is reviewing your files. Compare codes for a first connection.")
+                        TransferCode(senderState.verifyCode)
+                        trustPanel()
+                        SecondaryAction("Cancel sending", onCancelClick)
+                    }
+                    receiverState is ReceiverState.AcceptPrompt -> {
+                        if (catchTicket != null) {
+                            Heading("Ready to Catch", "${peerIdentity?.label ?: "Trusted sender"} · identity verified")
+                            IncomingPreview(receiverState.previewName, summary(receiverState.offer.fileCount, receiverState.offer.totalBytes))
+                            Text("Hold a fist, then open your palm to receive. Or tap Catch files.")
+                            gesturePanel()
+                            PrimaryAction("Catch files", onCatchClick)
+                            CameraChoice(cameraEnabled, onCameraToggle)
+                            trustPanel()
+                            SecondaryAction("Decline", onDenyClick)
+                        } else if (trustedSession) {
+                            Heading("Catch window closed", "Open a new receive window for your trusted sender.")
+                            SecondaryAction("Back to home", onCancelClick)
+                        } else {
+                            Heading("Check before receiving", "From ${peerName ?: "Nearby device"}")
+                            IncomingPreview(receiverState.previewName, summary(receiverState.offer.fileCount, receiverState.offer.totalBytes))
+                            TransferCode(receiverState.verifyCode)
+                            Text("Compare this code on both phones. Accept only if it matches.")
+                            trustPanel()
+                            PrimaryAction("Accept files", onAcceptClick)
+                            SecondaryAction("Decline", onDenyClick)
+                        }
+                    }
+                    senderState is SenderState.Linking || receiverState is ReceiverState.Linking ||
+                        senderState is SenderState.Auth || receiverState is ReceiverState.Auth -> {
+                        Heading("Connecting your phones", "Setting up the encrypted transfer.")
+                        SecondaryAction("Cancel", onCancelClick)
+                    }
+                    transfer != null || receiving != null -> {
+                        Heading(if (transfer != null) "On its way" else "Catching your files", transfer?.currentFileName ?: receiving!!.currentFileName)
+                        LinearProgressIndicator(progress = { progress ?: 0f }, modifier = Modifier.fillMaxWidth())
+                        Text("${((progress ?: 0f) * 100).toInt()}%", style = MaterialTheme.typography.headlineMedium)
+                        SecondaryAction("Cancel transfer", onCancelClick)
+                    }
+                    receiverState is ReceiverState.Verifying -> Heading("Almost there", "Checking your files before saving them.")
+                    done -> {
+                        Heading(if (receiverState is ReceiverState.Done) "Caught and saved" else "Delivered",
+                            if (receiverState is ReceiverState.Done) "Find your files in Downloads/YoDrop." else "Your files arrived on the other phone.")
+                        PrimaryAction("Done", onCancelClick)
+                    }
+                    senderState is SenderState.Failed || receiverState is ReceiverState.Failed -> {
+                        val failure = senderState as? SenderState.Failed
+                        val other = receiverState as? ReceiverState.Failed
+                        val resume = failure?.canResume == true || other?.canResume == true
+                        Heading(if (resume) "Reconnecting" else "Couldn't finish", if (resume) "Keep both phones nearby with Wi-Fi on. Your transfer can resume."
+                            else failure?.error ?: other!!.error)
+                        SecondaryAction(if (resume) "Cancel" else "Back to home", onCancelClick)
+                    }
+                    else -> {
+                        Heading("Transfer closed", "Your phones are ready for a fresh start.")
+                        PrimaryAction("Back to home", onCancelClick)
                     }
                 }
             }
+        }
+    }
+}
 
-            senderState is SenderState.Linking || receiverState is ReceiverState.Linking -> {
-                CircularProgressIndicator()
-                Text("Accepted. Setting up connection...", modifier = Modifier.padding(top = 16.dp))
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) { Text("Cancel") }
-            }
-
-            senderState is SenderState.Cancelled || receiverState is ReceiverState.Cancelled -> {
-                Text("Transfer cancelled")
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) { Text("Back to Home") }
-            }
-
-            senderState is SenderState.Transferring -> {
-                Text("Sending: ${senderState.currentFileName}")
-                LinearProgressIndicator(
-                    progress = { senderState.progress },
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp)
-                )
-                Text("${(senderState.progress * 100).toInt()}%")
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Cancel")
-                }
-            }
-
-            receiverState is ReceiverState.Receiving -> {
-                Text("Receiving: ${receiverState.currentFileName}")
-                LinearProgressIndicator(
-                    progress = { receiverState.progress },
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp)
-                )
-                Text("${(receiverState.progress * 100).toInt()}%")
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Cancel")
-                }
-            }
-
-            senderState is SenderState.Done || receiverState is ReceiverState.Done -> {
-                Text("Transfer Complete!", style = MaterialTheme.typography.headlineMedium)
-                if (receiverState is ReceiverState.Done) Text("Saved in Downloads/YoDrop")
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Back to Home")
-                }
-            }
-
-            senderState is SenderState.Failed -> {
-                Text(if (senderState.canResume) "Connection lost. Reconnecting..." else "Transfer Failed: ${senderState.error}", color = MaterialTheme.colorScheme.error)
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Reset")
-                }
-            }
-
-            receiverState is ReceiverState.Failed -> {
-                Text(if (receiverState.canResume) "Connection lost. Reconnecting..." else "Transfer Failed: ${receiverState.error}", color = MaterialTheme.colorScheme.error)
-                Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
-                    Text("Reset")
-                }
-            }
+@Composable private fun Heading(title: String, detail: String) {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(title, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+        Text(detail, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+@Composable private fun PrimaryAction(label: String, action: () -> Unit) {
+    Button(action, Modifier.fillMaxWidth().heightIn(min = 54.dp)) { Text(label, style = MaterialTheme.typography.titleMedium) }
+}
+@Composable private fun SecondaryAction(label: String, action: () -> Unit) {
+    OutlinedButton(action, Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(label) }
+}
+@Composable private fun CameraChoice(enabled: Boolean, action: () -> Unit) {
+    TextButton(action) { Text(if (enabled) "Turn camera off · use buttons" else "Use hand gestures") }
+}
+@Composable private fun TransferCode(code: String) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp)) {
+            Text("TRANSFER CODE", style = MaterialTheme.typography.labelSmall)
+            Text(code, style = MaterialTheme.typography.displaySmall, color = MaterialTheme.colorScheme.primary)
+        }
+    }
+}
+@Composable private fun IncomingPreview(name: String, summary: String) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(name, style = MaterialTheme.typography.titleLarge)
+            Text(summary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Saves to Downloads/YoDrop", style = MaterialTheme.typography.bodySmall)
         }
     }
 }

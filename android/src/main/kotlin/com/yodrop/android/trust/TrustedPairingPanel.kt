@@ -9,7 +9,7 @@ import androidx.compose.ui.unit.dp
 import com.yodrop.core.trust.*
 import kotlinx.coroutines.delay
 
-/** Small R1 controls; the preview/grab/catch redesign is R2. */
+/** Identity controls and explicit, selected-target receive windows. */
 @Composable
 fun TrustedPairingPanel(
     devices: List<TrustedDevice>, status: TrustStorageStatus, peer: PeerIdentityStatus?,
@@ -17,7 +17,7 @@ fun TrustedPairingPanel(
     onRemember: (PeerIdentityStatus) -> Unit, onReceive: (String) -> Unit,
     onForget: (TrustedDevice) -> Unit, onCloseWindow: (String) -> Unit, onReset: () -> Unit
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by remember { mutableStateOf(true) }
     var seconds by remember(window?.token) { mutableLongStateOf(60) }
     LaunchedEffect(window?.token) {
         if (window != null) while (true) {
@@ -35,12 +35,12 @@ fun TrustedPairingPanel(
         }
         if (window != null) {
             val name = devices.firstOrNull { it.fingerprint == window.target }?.label ?: "Selected device"
-            Text("Trusted Receive: $name · ${seconds}s")
-            Text("Check the sender, then tap Accept. Leaving the app closes this window.", style = MaterialTheme.typography.bodySmall)
+            Text("Catch from $name · ${seconds}s", color = MaterialTheme.colorScheme.primary)
+            Text("Catch appears after identity verification. Leaving the app closes this window.", style = MaterialTheme.typography.bodySmall)
             TextButton(onClick = { onCloseWindow(window.token) }) { Text("Close receive window") }
         }
         if (idle) {
-            TextButton(onClick = { expanded = !expanded }) { Text("Trusted devices (${devices.size})") }
+            TextButton(onClick = { expanded = !expanded }) { Text("Catch from a trusted device (${devices.size})") }
             if (expanded) {
                 when (status) {
                     TrustStorageStatus.LOADING -> Text("Loading device identity...")
@@ -54,7 +54,7 @@ fun TrustedPairingPanel(
                             Text(device.label)
                             Text("Key: ${device.fingerprint.takeLast(16)}", style = MaterialTheme.typography.bodySmall)
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedButton(onClick = { onReceive(device.fingerprint) }) { Text("Receive for 60s") }
+                                OutlinedButton(onClick = { onReceive(device.fingerprint) }) { Text("Get ready to Catch") }
                                 TextButton(onClick = { onForget(device) }) { Text("Forget") }
                             }
                         }

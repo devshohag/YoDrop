@@ -41,8 +41,10 @@ YoDrop/
 ## 4. Flow
 ```
 Sender: select file → open camera → ✋ palm → ✊ fist = GRABBED (haptic) → BLE advertise service UUID (read OFFER over GATT)
-Receiver: app open, scanning → sees OFFER → 🖐 open palm (fist→palm) within 10s = CLAIM
-→ Accept prompt (sender name + file summary + 4-digit verify code)
+Known receiver: select trusted sender → 60s foreground window → automatic CLAIM/identity verification
+→ encrypted preview → fresh fist→palm Catch (or Catch files tap) = consent
+New receiver: Receive from a new device → review OFFER/CLAIM within 10s
+→ explicit Accept prompt (sender name + file summary + 4-digit verify code)
 → link setup → encrypted TCP transfer → verify hash → DONE (haptic + sound)
 ```
 - Tap fallback ("Send" / "Receive" buttons) must always exist alongside gesture.
@@ -57,7 +59,7 @@ Receiver: app open, scanning → sees OFFER → 🖐 open palm (fist→palm) wit
 
 Complete Android before P7-P10: R1 authenticated trusted pairing and a bounded
 receive window; R2 preview/grab/catch UI; R3 two-phone acceptance and fixes.
-R1 retains explicit Accept for every transfer. R2 may treat a deliberate Catch
+R1 retained explicit Accept for every transfer. R2 treats a deliberate Catch
 as consent only for a cryptographically verified pinned device, the selected
 target and a live foreground receive window. Unrecognized devices retain explicit
 Accept/code comparison. Group mode remains P10, outside this redesign scope.
@@ -85,7 +87,34 @@ using a monotonic clock. CLAIM binds it to one session; authentication must matc
 the selected fingerprint, and consent must occur before expiry. Cancel, leaving
 the foreground, reset, revocation or terminal state closes it. It is never restored
 after process/activity recreation. Expiry/background closes only waiting consent,
-not a transfer that already obtained valid consent. R1 does not auto-accept data.
+not a transfer that already obtained valid consent. R1 did not auto-accept data.
+
+R2 has one sending entry: document selection always stages a file preview before
+Grab. Palm->fist or the Grab files tap hands the existing streaming sources to
+the runtime and advertises. Discard/Activity destruction before Grab closes the
+sources; preview selections are not restored. Optional provider thumbnails are
+bounded to 360x240 and loaded off the UI thread; unsupported types keep metadata.
+
+Selecting a trusted sender explicitly arms the R1 window. Android automatically
+reads/reconnects/CLAIMs the first discovered offer to authenticate it; CLAIM alone
+grants no data consent. A different identity safely refuses the session (retry is
+required; there is still one GATT connection and no public identity advertisement).
+Only the matching pinned proof plus authenticated encrypted preview produces a
+Catch ticket bound to window token, session token and fingerprint. A **fresh**
+stable fist->palm sequence after that ticket appears, or Catch files tap, submits
+encrypted consent and consumes the window once. Pre-authentication gestures cannot
+be queued; a context change resets the gate. No separate Accept tap is needed for
+this selected trusted flow. An ordinary Receive, newly saved pin, legacy peer or
+unselected trusted peer retains manual Accept. Closed trusted windows never fall
+back to a manual Accept screen for that session.
+
+Camera preview is a small, optional 112x144 view and closes after Grab/Catch,
+on pause and on terminal states. Permission prompts resolve before arming a trusted
+window; denial keeps the tap path. The runtime rechecks the foreground lease after
+registry/discovery suspension; Catch rechecks proof/pin/session/window/deadline
+under the controller mutex. Decorative waiting/progress/completion animation never
+authorizes anything. Camera accuracy, visual layout and two-phone radio behavior
+remain R3 physical acceptance work.
 
 ## 5. Protocol
 
@@ -115,8 +144,8 @@ Approved A4 discovery lifecycle:
 - Android requests MTU 247 after connection, retaining fragmentation using the
   actual negotiated MTU (default 23 fallback). Debug-only MTU probes can request 23.
 - Receiver stays CLAIMED until authenticated OFFER_DETAILS supplies previewName;
-  only then show the accept prompt. The 60-second post-CLAIM timer bounds waiting
-  for details and acceptance. LINK_INFO still follows explicit ACCEPT.
+  only then show the accept/Catch prompt. The 60-second post-CLAIM timer bounds waiting
+  for details and acceptance. LINK_INFO follows explicit Accept or valid trusted Catch consent.
 - Future iOS sender advertises only this service UUID while foreground; no service
   data support is required. This does not implement iOS or background discovery.
 
@@ -147,7 +176,7 @@ Frame: `[u32 length][u8 type][payload]`, big-endian. Control payloads = kotlinx.
 ## 6. Security
 - X25519 ECDH (keys from OFFER/CLAIM) → HKDF-SHA256(salt=sessionId) → `sessionKey` (32B) + `nonceBase` (8B).
 - AES-256-GCM, nonce = nonceBase(8B) ‖ u32 counter (unique per message per direction; separate key per direction via HKDF info "s2r"/"r2s").
-- Nothing transfers before explicit ACCEPT. Session expires 60s after OFFER if unclaimed.
+- Nothing transfers before explicit Accept or deliberate Catch in the authenticated selected trusted window. Session expires 60s after OFFER if unclaimed.
 - Camera frames processed on-device only, never stored/uploaded.
 
 ## 7. Transport selector (priority)

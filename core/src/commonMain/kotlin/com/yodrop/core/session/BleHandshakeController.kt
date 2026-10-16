@@ -23,6 +23,7 @@ class BleHandshakeController(
     private val onOfferRead: (suspend (String, OfferMessage) -> Unit)? = null,
     private val connectForClaim: (suspend (String, OfferMessage) -> Unit)? = null,
     private val trustedPairing: TrustedPairing? = null,
+    private val autoClaimTrustedOffers: Boolean = false,
     private val send: suspend (String, BleControlMessage) -> Unit
 ) {
     private val mutex = Mutex()
@@ -89,7 +90,8 @@ class BleHandshakeController(
                 offerPeer = peer
                 _peerName.value = message.senderName
                 onOfferRead?.invoke(peer, message)
-                true
+                // Read/reconnect authenticates a selected device; it grants no file consent.
+                if (autoClaimTrustedOffers && trustedPairing?.requiredWindow != null) claimLocked() else true
             }
             is ClaimMessage -> {
                 val hello = hellos[peer] ?: return@withLock false
@@ -160,34 +162,36 @@ class BleHandshakeController(
         return true
     }
 
-    suspend fun claim(): Boolean = mutex.withLock {
-        val peer = offerPeer ?: return@withLock false
-        val offer = (receiver.state.value as? ReceiverState.OfferSeen)?.offer ?: return@withLock false
+    suspend fun claim(): Boolean = mutex.withLock { claimLocked() }
+
+    private suspend fun claimLocked(): Boolean {
+        val peer = offerPeer ?: return false
+        val offer = (receiver.state.value as? ReceiverState.OfferSeen)?.offer ?: return false
         val trustWindow = trustedPairing?.requiredWindow
         if (trustWindow != null && !negotiatesTrust(hellos[peer])) {
             trustedPairing?.receiveWindow?.close(trustWindow.token)
             receiver.cancel("Selected trusted device does not support authenticated pairing")
-            return@withLock false
+            return false
         }
         val claim = receiver.claimOffer()
         try {
             val channel = checkNotNull(receiver.pairingChannel())
             val bound = if (trustWindow != null) trustedPairing?.receiveWindow?.bind(channel.token) else null
             if (trustWindow != null && bound == null) {
-                receiver.cancel("Trusted receive window expired"); return@withLock false
+                receiver.cancel("Trusted receive window expired"); return false
             }
             connectForClaim?.invoke(peer, offer)
             if (receiver.state.value !is ReceiverState.Claimed || (bound != null && trustedPairing?.receiveWindow?.isLive(bound) != true)) {
-                receiver.cancel("Claim/receive window expired before reconnect completed"); return@withLock false
+                receiver.cancel("Claim/receive window expired before reconnect completed"); return false
             }
             send(peer, claim)
-            if (negotiatesTrust(hellos[peer]) && !beginIdentity(peer, channel, bound)) return@withLock false
+            if (negotiatesTrust(hellos[peer]) && !beginIdentity(peer, channel, bound)) return false
         } catch (cancelled: CancellationException) {
             receiver.cancel("Claim cancelled"); throw cancelled
         } catch (failure: Exception) {
             receiver.cancel("Could not reconnect to sender"); throw failure
         }
-        true
+        return true
     }
 
     /** The caller's explicit code-match confirmation is bound to this proof and live prompt. */
@@ -206,22 +210,44 @@ class BleHandshakeController(
         _peerIdentity.value = status.copy(trusted = trustedPairing?.registry?.find(status.fingerprint) != null)
     }
 
-    suspend fun accept(): Boolean = mutex.withLock {
-        val peer = offerPeer ?: return@withLock false
-        if (receiver.state.value !is ReceiverState.AcceptPrompt) return@withLock false
+    /** Advisory UI snapshot. Calling this never consumes a window or accepts data. */
+    fun catchTicket(): TrustedCatchTicket? {
+        val trust = trustedPairing ?: return null
+        val p = pending ?: return null
+        val bound = p.window ?: return null
+        val window = trust.receiveWindow.state.value ?: return null
+        val identity = _peerIdentity.value ?: return null
+        if (receiver.state.value !is ReceiverState.AcceptPrompt || p.channel.role != PairingRole.RECEIVER || p.proof == null ||
+            identity.sessionToken != p.channel.token || !identity.trusted || identity.fingerprint != bound.target ||
+            window != bound || trust.requiredWindow?.token != bound.token ||
+            trust.registry.status.value != TrustStorageStatus.READY || trust.registry.devices.value.none { it.fingerprint == bound.target }) return null
+        return TrustedCatchTicket(bound.token, p.channel.token, bound.target)
+    }
+
+    /** A fresh deliberate gesture or its tap fallback; never queued from OFFER_SEEN or restored. */
+    suspend fun catchTransfer(ticket: TrustedCatchTicket): Boolean = mutex.withLock {
+        if (catchTicket() != ticket) return@withLock false
+        acceptLocked()
+    }
+
+    suspend fun accept(): Boolean = mutex.withLock { acceptLocked() }
+
+    private suspend fun acceptLocked(): Boolean {
+        val peer = offerPeer ?: return false
+        if (receiver.state.value !is ReceiverState.AcceptPrompt) return false
         val p = pending
-        if (p != null && (p.proof == null || !current(p))) return@withLock false
+        if (p != null && (p.proof == null || !current(p))) return false
         val fingerprint = p?.proof?.let { IdentityKeys.fingerprint(it.publicKey) }
         if (p?.window != null && (fingerprint == null || trustedPairing?.registry?.find(fingerprint) == null ||
                 trustedPairing.receiveWindow.permits(p.window, p.channel.token, fingerprint).not())) {
-            rejectPairing(p); return@withLock false
+            rejectPairing(p); return false
         }
         val decision = receiver.acceptTransfer()
         if (p?.window != null && !checkNotNull(trustedPairing).receiveWindow.consume(p.window, p.channel.token, checkNotNull(fingerprint))) {
-            rejectPairing(p); return@withLock false
+            rejectPairing(p); return false
         }
         send(peer, if (p != null) p.channel.seal(PairingControl.Consent(true)) else decision)
-        true
+        return true
     }
 
     suspend fun deny(): Boolean = mutex.withLock {

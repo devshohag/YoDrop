@@ -5,6 +5,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -44,17 +47,23 @@ fun GestureCameraPanel(owner: LifecycleOwner, context: GestureContext, onCommand
         camera.start()
         onDispose { owner.lifecycle.removeObserver(observer); camera.stop() }
     }
-    Column(Modifier.fillMaxWidth()) {
-        AndroidView(factory = { view }, modifier = Modifier.fillMaxWidth().height(200.dp))
-        Text(status, style = MaterialTheme.typography.bodySmall)
-        Text("Hand: ${when (pose) { HandPose.PALM -> "Open palm"; HandPose.FIST -> "Fist"; HandPose.NONE -> "Not detected / more than one hand"; HandPose.UNKNOWN -> "Move hand fully into view" }}")
-        Text(when (context.mode) {
-            GestureMode.SEND -> "Hold an open palm, then close into a fist to send."
-            GestureMode.CLAIM -> "Hold a fist, then open your palm to claim. Accept stays a separate tap."
-            GestureMode.OBSERVE -> "Waiting for an offer. Then hold a fist and open your palm to claim."
-            else -> "Hold each pose briefly: palm to fist = Grab; fist to palm = Release."
-        }, style = MaterialTheme.typography.bodySmall)
-        if (context.mode == GestureMode.PRACTICE) Text("Grab: $grabs  Release: $releases  Last: ${lastAction ?: "None"}")
-        Text("Camera stays on this device. Frames are not saved.", style = MaterialTheme.typography.bodySmall)
+    Card(Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            AndroidView(factory = { view }, modifier = Modifier.width(112.dp).height(144.dp).clip(RoundedCornerShape(16.dp)))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(when (pose) { HandPose.PALM -> "Open palm"; HandPose.FIST -> "Fist"; HandPose.NONE -> "Show one hand"; HandPose.UNKNOWN -> "Keep your hand in view" },
+                    style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                Text(when (context.mode) {
+                    GestureMode.SEND -> "Open palm → fist\nGrab your files"
+                    GestureMode.CATCH -> "Fist → open palm\nCatch these files"
+                    GestureMode.CLAIM -> "Fist → open palm\nReview this offer. Accept is a separate tap."
+                    GestureMode.OBSERVE -> "Waiting for a verified offer. Gestures cannot accept anything yet."
+                    else -> "Palm → fist: Grab\nFist → palm: Catch"
+                }, style = MaterialTheme.typography.bodySmall)
+                Text(status, style = MaterialTheme.typography.labelSmall)
+                if (context.mode == GestureMode.PRACTICE) Text("Grab $grabs · Catch $releases\nLast: ${lastAction ?: "None"}", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+        Text("Camera stays on your phone. No frames saved.", Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp), style = MaterialTheme.typography.labelSmall)
     }
 }

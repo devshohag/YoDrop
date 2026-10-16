@@ -8,12 +8,14 @@ import androidx.activity.compose.setContent
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.withResumed
 import com.yodrop.android.transport.hotspot.HotspotProbe
 import com.yodrop.android.transport.hotspot.HotspotProbeScreen
 import com.yodrop.android.ui.MainScreen
 import com.yodrop.android.trust.TrustedPairingPanel
 import com.yodrop.core.trust.PeerIdentityStatus
 import com.yodrop.core.trust.TrustedDevice
+import com.yodrop.core.trust.TrustedCatchTicket
 import com.yodrop.android.gesture.GestureCameraPanel
 import com.yodrop.android.gesture.AndroidTransferFeedback
 import com.yodrop.android.storage.PreparedDocuments
@@ -32,25 +34,28 @@ class MainActivity : ComponentActivity() {
     private val pickSendFile = registerForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
-        val gesture = useGestureForSelection
-        useGestureForSelection = false
-        if (uris.isNotEmpty()) startUriSendFlow(uris, gesture)
+        if (uris.isNotEmpty()) startUriSendFlow(uris)
     }
 
 
     private val uiLease = java.util.UUID.randomUUID().toString()
-    private var useGestureForSelection = false
-    private data class GestureFiles(val token: String, val documents: PreparedDocuments)
+    private data class GestureFiles(val token: String, val documents: PreparedDocuments, val previewUri: Uri?)
     private val staged = kotlinx.coroutines.flow.MutableStateFlow<GestureFiles?>(null)
     private val practicing = kotlinx.coroutines.flow.MutableStateFlow(false)
-    private val receiverGestures = kotlinx.coroutines.flow.MutableStateFlow(false)
+    private val gesturesEnabled = kotlinx.coroutines.flow.MutableStateFlow(false)
     private val cameraAllowed = kotlinx.coroutines.flow.MutableStateFlow(false)
     private var pendingCameraAction: (() -> Unit)? = null
+    private var pendingCameraFallback: (() -> Unit)? = null
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         cameraAllowed.value = granted
         val action = pendingCameraAction; pendingCameraAction = null
+        val fallback = pendingCameraFallback; pendingCameraFallback = null
         if (granted) action?.invoke()
-        else Toast.makeText(this, "Camera is optional. Send/Receive buttons are still available.", Toast.LENGTH_LONG).show()
+        else {
+            gesturesEnabled.value = false
+            Toast.makeText(this, "Camera is optional. Grab/Catch buttons are available.", Toast.LENGTH_LONG).show()
+            fallback?.invoke()
+        }
     }
     private val preparing = kotlinx.coroutines.flow.MutableStateFlow(false)
     private var preparationJob: kotlinx.coroutines.Job? = null
@@ -90,9 +95,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         runtime = com.yodrop.android.service.TransferRuntime.get(this)
-        useGestureForSelection = savedInstanceState?.getBoolean("p6_picker_gesture") ?: false
         practicing.value = savedInstanceState?.getBoolean("p6_practice") ?: false
-        receiverGestures.value = savedInstanceState?.getBoolean("p6_receiver") ?: false
+        // A receive-window gesture is never restored after Activity recreation.
         cameraAllowed.value = checkSelfPermission(android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         val debug = applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
         if (debug) runtime.configureGattDebug(intent.getIntExtra("yodrop_ble_mtu", 247).takeIf { it in 23..517 } ?: 247,
@@ -118,18 +122,20 @@ class MainActivity : ComponentActivity() {
             val preparingFiles by preparing.collectAsState()
             val gestureFiles by staged.collectAsState()
             val practice by practicing.collectAsState()
-            val receiverCamera by receiverGestures.collectAsState()
+            val cameraEnabled by gesturesEnabled.collectAsState()
             val permission by cameraAllowed.collectAsState()
             val trustedDevices by runtime.trustedDevices.devices.collectAsState()
             val trustStatus by runtime.trustedDevices.status.collectAsState()
             val identity by handshake.peerIdentity.collectAsState()
             val receiveWindow by runtime.trustedPairing.receiveWindow.state.collectAsState()
-            val canShowCamera = permission && !preparingFiles && (
+            val catchTicket = handshake.catchTicket()
+            val canShowCamera = permission && (cameraEnabled || practice) && !preparingFiles && (
                 practice || (gestureFiles != null && senderState is SenderState.Idle && receiverState is ReceiverState.Idle) ||
-                    (receiverCamera && (receiverState is ReceiverState.Scanning || receiverState is ReceiverState.OfferSeen)))
+                    catchTicket != null || receiverState is ReceiverState.Scanning || receiverState is ReceiverState.OfferSeen || receiverState is ReceiverState.Claimed)
             val context = when {
                 practice -> GestureContext(GestureMode.PRACTICE, "practice")
                 gestureFiles != null -> GestureContext(GestureMode.SEND, gestureFiles!!.token)
+                catchTicket != null -> catchTicket.gestureContext
                 receiverState is ReceiverState.OfferSeen -> GestureContext(GestureMode.CLAIM, offerToken(receiverState as ReceiverState.OfferSeen))
                 else -> GestureContext(GestureMode.OBSERVE, "scan")
             }
@@ -139,8 +145,13 @@ class MainActivity : ComponentActivity() {
                 receiverState = receiverState,
                 peerName = peerName,
                 preparingFiles = preparingFiles,
-                gestureSendingReady = gestureFiles != null,
-                gestureFileSummary = gestureFiles?.documents?.files?.let { "${it.size} file(s), ${it.sumOf { file -> file.size }} bytes selected" }.orEmpty(),
+                preparedFiles = gestureFiles?.documents?.files.orEmpty(),
+                previewUri = gestureFiles?.previewUri,
+                catchTicket = catchTicket,
+                trustedWindow = receiveWindow,
+                trustedSession = runtime.trustedPairing.requiredWindow != null,
+                peerIdentity = identity,
+                cameraEnabled = canShowCamera,
                 practicingGestures = practice,
                 gesturePanel = { if (canShowCamera) GestureCameraPanel(this@MainActivity, context, ::onGesture) },
                 trustPanel = {
@@ -149,16 +160,19 @@ class MainActivity : ComponentActivity() {
                         idle = senderState is SenderState.Idle && receiverState is ReceiverState.Idle,
                         mayRemember = senderState is SenderState.AwaitAccept || receiverState is ReceiverState.AcceptPrompt,
                         onRemember = ::confirmTrust,
-                        onReceive = { fingerprint -> withBlePermissions { launchBleAction { it.startTrustedReceiving(fingerprint) } } },
+                        onReceive = ::startTrustedCatch,
                         onForget = ::confirmForget,
                         onCloseWindow = { runtime.stopTrustedReceiving(it) },
                         onReset = ::confirmTrustReset)
                 },
-                onSendClick = { chooseFiles(false) },
-                onGestureSendClick = { chooseFiles(true) },
-                onSendPreparedClick = { gestureFiles?.let { files -> withBlePermissions { sendStaged(files.token) } } },
+                onSendClick = ::chooseFiles,
+                onSendPreparedClick = { gestureFiles?.let { files -> withBlePermissions { whenResumed { sendStaged(files.token) } } } },
                 onPracticeClick = { withCameraPermission { practicing.value = true } },
-                onReceiverGestureClick = { withCameraPermission { receiverGestures.value = true } },
+                onCameraToggle = {
+                    if (cameraEnabled) gesturesEnabled.value = false
+                    else withCameraPermission { gesturesEnabled.value = true }
+                },
+                onCatchClick = { catchTicket?.let(::catchFiles) },
                 onReceiveClick = {
                     withBlePermissions {
                         launchBleAction {
@@ -182,7 +196,7 @@ class MainActivity : ComponentActivity() {
                         preparing.value -> preparationJob?.cancel()
                         staged.value != null -> discardStaged()
                         practicing.value -> practicing.value = false
-                        else -> { receiverGestures.value = false; launchBleAction { it.reset() } }
+                        else -> { gesturesEnabled.value = false; launchBleAction { it.reset() } }
                     }
                 }
             )
@@ -248,9 +262,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putBoolean("p6_picker_gesture", useGestureForSelection)
         outState.putBoolean("p6_practice", practicing.value)
-        outState.putBoolean("p6_receiver", receiverGestures.value)
         super.onSaveInstanceState(outState)
     }
 
@@ -287,12 +299,26 @@ class MainActivity : ComponentActivity() {
             .setNegativeButton("Cancel", null).show()
     }
 
-    private fun chooseFiles(gesture: Boolean) = withBlePermissions {
-        useGestureForSelection = gesture
+    private fun chooseFiles() = withBlePermissions {
         pickSendFile.launch(arrayOf("*/*"))
     }
 
-    private fun withCameraPermission(action: () -> Unit) {
+    private fun whenResumed(action: () -> Unit) {
+        lifecycleScope.launch { lifecycle.withResumed { action() } }
+    }
+
+    private fun startTrustedCatch(fingerprint: String) = withBlePermissions {
+        // Resolve system prompts before arming; the live window closes on every ON_PAUSE.
+        val start = { whenResumed { launchBleAction { it.startTrustedReceiving(fingerprint) } } }
+        withCameraPermission(onFallback = start) { gesturesEnabled.value = true; start() }
+    }
+
+    private fun catchFiles(ticket: TrustedCatchTicket) {
+        if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return
+        launchBleAction { it.catchTransfer(ticket, uiLease) }
+    }
+
+    private fun withCameraPermission(onFallback: () -> Unit = {}, action: () -> Unit) {
         if (checkSelfPermission(android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             cameraAllowed.value = true; action(); return
         }
@@ -301,11 +327,13 @@ class MainActivity : ComponentActivity() {
             android.app.AlertDialog.Builder(this).setMessage("Enable camera in Settings to use gestures, or continue with the buttons.")
                 .setPositiveButton("Open settings") { _, _ -> startActivity(android.content.Intent(
                     android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) }
-                .setNegativeButton("Use buttons", null).show()
+                .setNegativeButton("Use buttons") { _, _ -> onFallback() }
+                .setOnCancelListener { onFallback() }.show()
             return
         }
         prefs.edit().putBoolean("camera_requested", true).apply()
         pendingCameraAction = action
+        pendingCameraFallback = onFallback
         cameraPermission.launch(android.Manifest.permission.CAMERA)
     }
 
@@ -316,7 +344,11 @@ class MainActivity : ComponentActivity() {
         when (command.context.mode) {
             GestureMode.PRACTICE -> if (practicing.value) AndroidTransferFeedback(applicationContext).grabbed()
             GestureMode.SEND -> if (command.action == GestureAction.GRAB && staged.value?.token == command.context.token)
-                withBlePermissions { sendStaged(command.context.token) }
+                withBlePermissions { whenResumed { sendStaged(command.context.token) } }
+            GestureMode.CATCH -> {
+                val ticket = handshake.catchTicket() ?: return
+                if (command.action == GestureAction.RELEASE && command.context == ticket.gestureContext) catchFiles(ticket)
+            }
             GestureMode.CLAIM -> {
                 val offer = receiverMachine.state.value as? ReceiverState.OfferSeen ?: return
                 if (command.action != GestureAction.RELEASE || offerToken(offer) != command.context.token) return
@@ -330,6 +362,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendStaged(token: String) {
+        if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return
         val batch = staged.value?.takeIf { it.token == token } ?: return
         staged.value = null // Transfer-job ownership begins before any suspension/destruction.
         val session = runtime
@@ -350,7 +383,7 @@ class MainActivity : ComponentActivity() {
         session.scope.launch { batch.documents.close() }
     }
 
-    private fun startUriSendFlow(uris: List<Uri>, gesture: Boolean) {
+    private fun startUriSendFlow(uris: List<Uri>) {
         if (preparing.value || runtime.active() ||
             senderMachine.state.value !is com.yodrop.core.session.SenderState.Idle ||
             receiverMachine.state.value !is com.yodrop.core.session.ReceiverState.Idle) return
@@ -363,13 +396,11 @@ class MainActivity : ComponentActivity() {
                 val prepared = documents
                 // Atomic ownership handoff: rotation must not close sources accepted by the runtime.
                 withContext(kotlinx.coroutines.NonCancellable) {
-                    if (gesture) {
-                        if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED))
-                            throw CancellationException("Selection screen closed")
-                        staged.value = GestureFiles(java.util.UUID.randomUUID().toString(), prepared)
-                        handedOff = true
-                        withCameraPermission {}
-                    } else handedOff = runtime.startSending(prepared.files, prepared.sources)
+                    if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED))
+                        throw CancellationException("Selection screen closed")
+                    staged.value = GestureFiles(java.util.UUID.randomUUID().toString(), prepared, uris.firstOrNull())
+                    handedOff = true
+                    withCameraPermission { gesturesEnabled.value = true }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
