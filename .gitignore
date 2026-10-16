@@ -6,3 +6,4 @@ local.properties
 .DS_Store
 .kotlin/
 ios/**/xcuserdata/
+android/src/main/assets/hand_landmarker.task

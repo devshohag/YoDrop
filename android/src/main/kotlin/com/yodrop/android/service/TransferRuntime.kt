@@ -9,6 +9,7 @@ import android.util.Base64
 import androidx.core.content.ContextCompat
 import com.yodrop.android.ble.AndroidBleManager
 import com.yodrop.android.storage.AndroidFileStorage
+import com.yodrop.android.gesture.AndroidTransferFeedback
 import com.yodrop.android.transport.*
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.platform.FileSource
@@ -22,6 +23,7 @@ import java.io.File
 /** Process/session ownership, independent of Activity lifecycle. No Activity is retained. */
 class TransferRuntime private constructor(context: Context) {
     private val app = context.applicationContext
+    private val feedback = AndroidTransferFeedback(app)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val _alerts = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val alerts = _alerts.asSharedFlow()
@@ -95,6 +97,8 @@ class TransferRuntime private constructor(context: Context) {
         scope.launch {
             sender.state.collect { state ->
                 try {
+                    if (state is SenderState.Grabbed) feedback.grabbed()
+                    if (state is SenderState.Done) feedback.completed()
                     if (state is SenderState.Grabbed) ble.startAdvertising(state) else ble.stopAdvertising()
                     if (state is SenderState.Failed && state.canResume) senderLink.recover()
                     if (state is SenderState.Done || state is SenderState.Cancelled || (state is SenderState.Failed && !state.canResume)) ble.close()
@@ -104,6 +108,8 @@ class TransferRuntime private constructor(context: Context) {
         scope.launch {
             receiver.state.collect { state ->
                 try {
+                    if (state is ReceiverState.Claimed) feedback.grabbed()
+                    if (state is ReceiverState.Done) feedback.completed()
                     if (state !is ReceiverState.Scanning) ble.stopScanning()
                     if (state is ReceiverState.Failed && state.canResume) receiverLink.recover()
                     if (state is ReceiverState.Done || state is ReceiverState.Cancelled || (state is ReceiverState.Failed && !state.canResume)) ble.close()

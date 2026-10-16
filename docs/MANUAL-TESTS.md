@@ -15,6 +15,7 @@ shared evidence. A blank/PENDING field cannot be counted as acceptance.
 First run the owner build/evidence script:
 
 ```powershell
+& .\scripts\prepare-p6-model.ps1
 & .\scripts\validate-step20.ps1 -TempDirectory D:\Temp
 Get-Content .\build\reports\step20\OWNER-VALIDATION.md
 ```
@@ -44,7 +45,8 @@ low-order rejection and input bounds. JVM results do not substitute for this run
 Then execute all applicable Step 12-19 rows below, plus receive smoke/permission
 denial on API 29/31/34. Final acceptance requires actual matching BLE codes, GATT
 MTUs, WFD throughput/resume, LAN/hash and foreground evidence. Passing just the
-owner script leaves physical acceptance pending. P6-P10 are not started here.
+owner script leaves physical acceptance pending. P6 now has its own implementation
+and [pending camera/device checklist](P6-VALIDATION.md); P7-P10 remain future work.
 
 ## Step 12: BLE discovery, tap CLAIM and verification code
 

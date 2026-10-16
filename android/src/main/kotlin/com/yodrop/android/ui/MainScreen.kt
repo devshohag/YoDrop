@@ -1,6 +1,8 @@
 package com.yodrop.android.ui
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -21,11 +23,20 @@ fun MainScreen(
     onDenyClick: () -> Unit,
     onCancelClick: () -> Unit,
     preparingFiles: Boolean = false,
+    gestureSendingReady: Boolean = false,
+    gestureFileSummary: String = "",
+    practicingGestures: Boolean = false,
+    onGestureSendClick: () -> Unit = {},
+    onSendPreparedClick: () -> Unit = {},
+    onPracticeClick: () -> Unit = {},
+    onReceiverGestureClick: () -> Unit = {},
+    gesturePanel: @Composable () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
         modifier = modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
@@ -36,11 +47,23 @@ fun MainScreen(
             modifier = Modifier.padding(bottom = 32.dp)
         )
 
+        gesturePanel()
+
         when {
+            practicingGestures -> {
+                Text("Practice only: no files are sent and no receiver is claimed.")
+                OutlinedButton(onClick = onCancelClick) { Text("Close practice") }
+            }
             preparingFiles -> {
                 CircularProgressIndicator()
                 Text("Preparing selected files...", modifier = Modifier.padding(top = 16.dp))
                 OutlinedButton(onClick = onCancelClick) { Text("Cancel") }
+            }
+            gestureSendingReady -> {
+                Text(gestureFileSummary)
+                Text("Open palm, then fist to start sending. You can also tap Send now.")
+                Button(onClick = onSendPreparedClick) { Text("Send now") }
+                OutlinedButton(onClick = onCancelClick) { Text("Cancel selected files") }
             }
             senderState is SenderState.Idle && receiverState is ReceiverState.Idle -> {
                 Button(
@@ -49,16 +72,19 @@ fun MainScreen(
                 ) {
                     Text("Send Files")
                 }
+                OutlinedButton(onClick = onGestureSendClick, modifier = Modifier.fillMaxWidth()) { Text("Send with gesture") }
                 OutlinedButton(
                     onClick = onReceiveClick,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
                 ) {
                     Text("Receive")
                 }
+                TextButton(onClick = onPracticeClick) { Text("Try gestures (one phone)") }
             }
 
             receiverState is ReceiverState.Scanning -> {
                 Text("Waiting for an offer...")
+                TextButton(onClick = onReceiverGestureClick) { Text("Use hand gesture") }
                 Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
                     Text("Cancel")
                 }
@@ -66,6 +92,7 @@ fun MainScreen(
             receiverState is ReceiverState.OfferSeen -> {
                 Text("From: ${peerName ?: "Nearby device"}")
                 Text("${receiverState.offer.fileCount} file(s), ${receiverState.offer.totalBytes} bytes")
+                TextButton(onClick = onReceiverGestureClick) { Text("Use hand gesture") }
                 Button(onClick = onClaimClick, modifier = Modifier.padding(top = 16.dp)) {
                     Text("Receive this file")
                 }

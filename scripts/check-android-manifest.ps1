@@ -13,7 +13,7 @@ foreach ($node in $root.SelectNodes("uses-permission")) {
     $permissions[$node.GetAttribute("name", $android)] = $node
 }
 foreach ($name in @(
-    "INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE", "CHANGE_WIFI_STATE", "WAKE_LOCK",
+    "INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE", "CHANGE_WIFI_STATE", "WAKE_LOCK", "CAMERA", "VIBRATE",
     "BLUETOOTH", "BLUETOOTH_ADMIN", "BLUETOOTH_SCAN", "BLUETOOTH_ADVERTISE", "BLUETOOTH_CONNECT",
     "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION", "NEARBY_WIFI_DEVICES", "POST_NOTIFICATIONS",
     "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_CONNECTED_DEVICE"
@@ -28,6 +28,11 @@ foreach ($name in @("ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION")) {
 }
 foreach ($name in @("BLUETOOTH_SCAN", "NEARBY_WIFI_DEVICES")) {
     Require ($permissions["android.permission.$name"].GetAttribute("usesPermissionFlags", $android) -eq "neverForLocation") "$name must use neverForLocation"
+}
+foreach ($name in @("camera", "camera.any", "camera.front", "camera.autofocus")) {
+    $features = @($root.SelectNodes("uses-feature") | Where-Object { $_.GetAttribute("name", $android) -eq "android.hardware.$name" })
+    Require ($features.Count -eq 1) "Expected optional camera feature $name"
+    Require ($features[0].GetAttribute("required", $android) -eq "false") "Camera feature $name must be optional for tap fallback"
 }
 $app = $root.SelectSingleNode("application")
 Require ($null -ne $app) "Missing application"

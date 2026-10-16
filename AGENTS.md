@@ -16,3 +16,8 @@ Read `docs/ARCHITECTURE.md` fully before writing code. It is the source of truth
 ## Commands
 - Core tests: `./gradlew :core:jvmTest`
 - Android build: `./gradlew :android:assembleDebug`
+
+
+## Approved dependency exception (A1, 2026-10-15)
+The owner approved BouncyCastle for X25519 only.
+See docs/DECISIONS.md Step 3. No other dependency exception is implied.

@@ -230,3 +230,47 @@ source/merged-manifest checks, clean JVM/app/instrumentation-APK builds, rejects
 empty/skipped/missing acceptance suites and records logs/counts/APK hashes. It
 never marks a physical test passed. STEP20-AUDIT.md records blockers/limitations;
 final acceptance remains pending until actual build and device evidence exists.
+
+## P6 — Android camera gestures and feedback
+
+Owner requested P6 after the Step 20 build; earlier physical radio, throughput,
+API 29 crypto and background acceptance remain pending. This implements the P6
+code, not a claim that normal-light detection meets 95% on physical phones.
+
+CameraX 1.4.2 and MediaPipe Tasks Vision 0.10.32 implement the architecture's
+approved stack without upgrading existing dependencies or SDK levels. A pinned,
+SHA-256-verified official float16/v1 hand model is prepared into ignored assets by
+prepare-p6-model.ps1, cached outside build/ and packaged for offline inference.
+No runtime model download. Source/license/modification notes: P6-THIRD-PARTY.md.
+
+The published SDK enables usage metrics. A fail-closed Gradle AAR transform binds
+its factory to the SDK's bundled TasksStatsDummyLogger, removes the two remote
+logging classes and excludes their DataTransport dependencies. It preserves other
+AAR content, including native libraries and license entries. The pinned factory
+hash and class layout must match; a future SDK change requires review.
+verifyPrivateMediaPipe runs before preBuild, for both debug and release. No
+reflection or post-initialization opt-out is used.
+
+Camera and model belong to the visible UI, stop on pause/disposal and never enter
+the transfer foreground service. One worker performs synchronous VIDEO inference
+on timestamped CameraX frames; KEEP_ONLY_LATEST input at about 15 fps bounds work.
+This avoids concurrent native image teardown. CameraX handles pixel/row strides;
+ImageProcessingOptions supplies rotation. Two visible hands disarm the gate.
+Frames/landmarks are not saved, logged or uploaded by the gesture path.
+
+Shared world-landmark geometry classifies palm/fist; four frames and 220 ms of a
+stable pose arm each edge. Gaps >250 ms, hand loss or >450 ms ambiguity disarm;
+700 ms command cooldown limits repeated practice events. A file/offer token or
+role change requires a fresh sequence. SEND emits only palm->fist; CLAIM only
+fist->palm. Each token is consumed once, including after loss/stale timestamps.
+Android rechecks the live lifecycle, source token and current OFFER before acting.
+The existing ten-second OFFER_SEEN deadline and explicit Accept/Deny remain final
+authorities; a gesture cannot accept data or create an endpoint by itself.
+
+Send Files and Receive remain tap actions without camera permission. Send with
+gesture stages prepared document sources until Grab or Send now. Cancel/activity
+destruction releases staged sources; configuration recreation before Grab requires
+reselection. After handoff the existing app runtime owns transfer sources and
+survives UI recreation. Try gestures is a separate practice mode, requires only
+camera and cannot send files or claim peers. Haptics occur on Grab/Claim, and Done
+adds a short notification tone; system haptic/silent/DND settings are respected.

@@ -1,0 +1,17 @@
+YoDrop P6 third-party notices
+
+Hand Landmarker (full), float16/version 1, by The MediaPipe Authors.
+Model unmodified. Licensed under Apache License, Version 2.0.
+License: LICENSE-P6-APACHE-2.0.txt in these assets.
+Source: https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+Model card: https://developers.google.com/edge/mediapipe/solutions/vision/hand_landmarker#models
+
+MediaPipe Tasks Vision/Core 0.10.32 by The MediaPipe Authors, Apache 2.0.
+YoDrop modification (2026-10-16): bind SDK logger factory to bundled no-op
+logger, remove remote logger classes and exclude their upload dependencies.
+Other SDK/native/model code is unmodified. No endorsement by the original authors.
+Source and modification: https://github.com/devshohag/YoDrop
+
+CameraX 1.4.2 by The Android Open Source Project, Apache 2.0.
+Camera-core also includes libyuv under its BSD license; see LICENSE-P6-LIBYUV.txt.
+Source: https://android.googlesource.com/platform/frameworks/support

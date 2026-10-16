@@ -60,3 +60,16 @@ After the dual build is green, commit as:
 
 API 29 crypto instrumentation is still pending from Step 3. This 512 MiB heap
 run does not claim Step 10's 1 GiB / 256 MiB heap acceptance criterion.
+
+## Owner dual-build verification
+
+After applying Step 9, the owner ran the combined clean JVM-test and Android
+assemble command successfully on Windows:
+
+```text
+BUILD SUCCESSFUL in 46s
+61 actionable tasks: 61 executed
+```
+
+This resolves the Step 9 dual-build pending item above. The owner pushed Step 9
+as c8fe3a7 before Step 10 began.
