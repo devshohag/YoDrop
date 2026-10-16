@@ -1,5 +1,6 @@
 package com.yodrop.core.session
 
+import com.yodrop.core.trust.PairingChannel
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.crypto.KeyPair
 import com.yodrop.core.crypto.NonceUtils
@@ -44,6 +45,10 @@ class SenderStateMachine(
 
     private var myKeyPair: KeyPair? = null
     private var sessionKeys: SessionKeys? = null
+    private var identityChannel: PairingChannel? = null
+    internal suspend fun pairingChannel(): PairingChannel? = eventMutex.withLock {
+        if (_state.value is SenderState.AwaitAccept || _state.value is SenderState.Linking) identityChannel else null
+    }
     private var sessionId: ByteArray? = null
     private var filesToSend: List<FileMeta> = emptyList()
     private var fileSourceMap: Map<String, FileSource> = emptyMap()
@@ -169,6 +174,7 @@ class SenderStateMachine(
             publishLocked(SenderState.Claimed)
             val keys = CryptoEngine.deriveSessionKeys(sharedSecret, sid)
             sessionKeys = keys
+            identityChannel = PairingChannel(keys, sid, keyPair.publicKey, claim.receiverPubKey, PairingRole.SENDER)
             publishLocked(SenderState.AwaitAccept(keys.verifyCode))
 
             acceptTimeoutJob = scope.launch {
@@ -506,6 +512,7 @@ class SenderStateMachine(
             workers.clear()
             myKeyPair = null
             sessionKeys = null
+            identityChannel = null
             sessionId = null
             filesToSend = emptyList()
             fileSourceMap = emptyMap()

@@ -53,6 +53,40 @@ Receiver: app open, scanning → sees OFFER → 🖐 open palm (fist→palm) wit
   pending-row publication; unfinished files are not shown as completed downloads.
 - Multiple receivers: first CLAIM wins for single send; Group mode accepts all CLAIMs in the window.
 
+### Android redesign R1-R3 (approved by owner, 2026-10-16)
+
+Complete Android before P7-P10: R1 authenticated trusted pairing and a bounded
+receive window; R2 preview/grab/catch UI; R3 two-phone acceptance and fixes.
+R1 retains explicit Accept for every transfer. R2 may treat a deliberate Catch
+as consent only for a cryptographically verified pinned device, the selected
+target and a live foreground receive window. Unrecognized devices retain explicit
+Accept/code comparison. Group mode remains P10, outside this redesign scope.
+
+R1 uses a nonexportable Android Keystore P-256 signing identity, separate from
+ephemeral X25519 transfer keys. Public identities are exchanged only after CLAIM,
+encrypted under fresh session keys. Each signs the role, session ID and both
+ephemeral keys. Local explicit code-match confirmation pins its SHA-256 public-key
+fingerprint; names, HELLO IDs and Bluetooth addresses never establish trust.
+Initial trust compares the full 96-bit pairing code (six groups of four hex digits),
+binding both identity keys and the ephemeral transcript in canonical role order.
+The existing four-digit transfer code remains; it alone is not trust enrollment.
+Both owners confirm separately. Forget/reset removes local authorization; a
+reinstalled/changed identity requires pairing again. Trusted metadata is bounded,
+encrypted with Keystore AES-GCM and atomically stored in no-backup app storage.
+
+HELLO capability bit 6 negotiates R1. New peers use encrypted pairing-control
+tag 08 (identity proof and consent), with separate directional keys/nonces and
+replay counters; plaintext ACCEPT/DENY is rejected when R1 is negotiated. Legacy
+peers keep manual Accept and cannot gain trusted status. OFFER remains the same
+five public fields and discovery remains UUID-only, one GATT connection at a time.
+
+Trusted receive is explicitly armed for one selected pinned fingerprint for 60 s,
+using a monotonic clock. CLAIM binds it to one session; authentication must match
+the selected fingerprint, and consent must occur before expiry. Cancel, leaving
+the foreground, reset, revocation or terminal state closes it. It is never restored
+after process/activity recreation. Expiry/background closes only waiting consent,
+not a transfer that already obtained valid consent. R1 does not auto-accept data.
+
 ## 5. Protocol
 
 ### 5.1 BLE phase (control, small)
@@ -64,7 +98,8 @@ GATT service UUID: random 128-bit UUID generated once, stored in `core/protocol/
 | OFFER | S→R (plain GATT) | sessionId (16B), senderPubKey (X25519 32B), senderName, fileCount, totalBytes |
 | CLAIM | R→S | sessionId, receiverPubKey (32B) |
 | OFFER_DETAILS (0x07) | S→R (encrypted after CLAIM/ECDH) | previewName; outer envelope counter + ciphertext |
-| ACCEPT / DENY | R→S | sessionId, reason |
+| ACCEPT / DENY | R→S | sessionId, reason (legacy manual flow only when R1 is not negotiated) |
+| PAIRING_CONTROL (0x08) | both | role, counter, ciphertext: signed identity proof or authenticated consent |
 | LINK_INFO | S→R (encrypted) | linkType, ssid?, passphrase?, ip, port |
 
 Approved A4 discovery lifecycle:

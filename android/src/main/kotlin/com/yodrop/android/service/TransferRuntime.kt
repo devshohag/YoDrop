@@ -10,6 +10,9 @@ import androidx.core.content.ContextCompat
 import com.yodrop.android.ble.AndroidBleManager
 import com.yodrop.android.storage.AndroidFileStorage
 import com.yodrop.android.gesture.AndroidTransferFeedback
+import com.yodrop.android.trust.AndroidTrustStorage
+import com.yodrop.core.trust.*
+import android.os.SystemClock
 import com.yodrop.android.transport.*
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.platform.FileSource
@@ -24,6 +27,12 @@ import java.io.File
 class TransferRuntime private constructor(context: Context) {
     private val app = context.applicationContext
     private val feedback = AndroidTransferFeedback(app)
+    private val trustStorage = AndroidTrustStorage(app)
+    val trustedDevices = TrustedDeviceRegistry(trustStorage)
+    val trustedPairing = TrustedPairing(trustStorage, trustedDevices, TrustedReceiveWindow(SystemClock::elapsedRealtime))
+    private var visibleUi: String? = null
+    private var trustedWindowToken: String? = null
+    private var trustedWindowTimer: Job? = null
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val _alerts = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val alerts = _alerts.asSharedFlow()
@@ -71,11 +80,12 @@ class TransferRuntime private constructor(context: Context) {
 
     init {
         check(Looper.myLooper() == Looper.getMainLooper())
+        scope.launch { trustedDevices.refresh() }
         val selector = AndroidSenderTransportSelector(app, sender)
         senderLink = AndroidSenderLinkSetup(scope, sender, selector, app)
         receiverLink = AndroidReceiverLinkSetup(app, scope, receiver)
         val hello = HelloMessage(Build.MODEL.ifBlank { "Android" }.take(64), Platform.ANDROID,
-            DeviceCaps.CAP_BLE or DeviceCaps.CAP_LAN or DeviceCaps.CAP_HOTSPOT_HOST or DeviceCaps.CAP_HOTSPOT_CLIENT or
+            DeviceCaps.CAP_TRUSTED_PAIRING or DeviceCaps.CAP_BLE or DeviceCaps.CAP_LAN or DeviceCaps.CAP_HOTSPOT_HOST or DeviceCaps.CAP_HOTSPOT_CLIENT or
                 (if (app.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_WIFI_DIRECT)) DeviceCaps.CAP_WIFI_DIRECT else 0),
             persistentDeviceId(), selector.activeLanAddress()?.ip)
         val snapshot = { hello.copy(lanIp = selector.activeLanAddress()?.ip) }
@@ -85,7 +95,7 @@ class TransferRuntime private constructor(context: Context) {
             prepareLink = { _, choice -> senderLink.prepare(choice) }, helloSnapshot = snapshot,
             onOfferRead = { peer, offer -> ble.offerRead(peer, offer) },
             connectForClaim = { peer, offer -> ble.connectForClaim(peer, offer) },
-            onLinkReady = { receiverLink.prepare(it) }) { peer, message -> ble.sendControlMessage(peer, message) }
+            onLinkReady = { receiverLink.prepare(it) }, trustedPairing = trustedPairing) { peer, message -> ble.sendControlMessage(peer, message) }
         scope.launch {
             ble.incomingMessages.collect {
                 try { handshake.onMessage(it) }
@@ -112,7 +122,10 @@ class TransferRuntime private constructor(context: Context) {
                     if (state is ReceiverState.Done) feedback.completed()
                     if (state !is ReceiverState.Scanning) ble.stopScanning()
                     if (state is ReceiverState.Failed && state.canResume) receiverLink.recover()
-                    if (state is ReceiverState.Done || state is ReceiverState.Cancelled || (state is ReceiverState.Failed && !state.canResume)) ble.close()
+                    if (state is ReceiverState.Done || state is ReceiverState.Cancelled || (state is ReceiverState.Failed && !state.canResume)) {
+                        trustedPairing.receiveWindow.close(); trustedWindowTimer?.cancel(); trustedWindowToken = null
+                        ble.close()
+                    }
                 } catch (_: SecurityException) { cancel("Bluetooth permission was revoked") }
             }
         }
@@ -154,7 +167,52 @@ class TransferRuntime private constructor(context: Context) {
         catch (failure: Exception) { receiver.cancel("Discovery could not start"); throw failure }
         finally { foreground.update(sender.state.value, receiver.state.value) }
     }
-    suspend fun cancel(reason: String = "User cancelled") { sender.cancel(reason); receiver.cancel(reason); ble.close() }
+    suspend fun cancel(reason: String = "User cancelled") {
+        trustedPairing.receiveWindow.close(); trustedWindowTimer?.cancel(); trustedWindowToken = null
+        sender.cancel(reason); receiver.cancel(reason); ble.close()
+    }
+    fun onUiResumed(lease: String) { visibleUi = lease }
+    fun onUiPaused(lease: String) {
+        if (visibleUi != lease) return
+        visibleUi = null
+        trustedPairing.receiveWindow.state.value?.let { stopTrustedReceiving(it.token, "Trusted receive closed when app left foreground") }
+    }
+    fun stopTrustedReceiving(token: String, reason: String = "Trusted receive closed") {
+        trustedPairing.receiveWindow.close(token) // Revoke immediately, even while a GATT write owns the controller mutex.
+        scope.launch {
+            if (trustedWindowToken == token && (receiver.state.value is ReceiverState.Scanning || receiver.state.value is ReceiverState.OfferSeen ||
+                    receiver.state.value is ReceiverState.Claimed || receiver.state.value is ReceiverState.AcceptPrompt)) cancel(reason)
+        }
+    }
+    suspend fun startTrustedReceiving(fingerprint: String) {
+        if (visibleUi == null || sender.state.value !is SenderState.Idle || receiver.state.value !is ReceiverState.Idle || trustedDevices.find(fingerprint) == null) return
+        val window = trustedPairing.armReceive(fingerprint)
+        trustedWindowToken = window.token
+        try {
+            startReceiving()
+            trustedWindowTimer?.cancel()
+            trustedWindowTimer = scope.launch {
+                while (trustedPairing.receiveWindow.state.value?.token == window.token) {
+                    if (!trustedPairing.receiveWindow.isLive(window)) { stopTrustedReceiving(window.token, "Trusted receive window expired"); break }
+                    delay(250)
+                }
+            }
+        } catch (failure: Exception) { cancel("Trusted discovery could not start"); throw failure }
+    }
+    suspend fun rememberPeer(token: String) {
+        if (!handshake.rememberPeer(token)) _alerts.emit("Could not trust this device. Check the active codes and pairing storage.")
+    }
+    suspend fun forgetTrusted(fingerprint: String) {
+        trustedPairing.receiveWindow.state.value?.takeIf { it.target == fingerprint }?.let { stopTrustedReceiving(it.token, "Trusted device removed") }
+        if (!trustedDevices.forget(fingerprint)) _alerts.emit("Could not update trusted devices. No new trust was granted.")
+        handshake.refreshPeerTrust()
+    }
+    suspend fun resetTrustedPairing() {
+        if (sender.state.value !is SenderState.Idle || receiver.state.value !is ReceiverState.Idle) return
+        trustedPairing.clearReceiveSession()
+        if (!trustedDevices.reset()) _alerts.emit("Trusted pairing storage is unavailable. Retry after checking device security/storage.")
+        handshake.refreshPeerTrust()
+    }
     suspend fun reset() { cancel(); handshake.reset(); sender.reset(); receiver.reset() }
     private fun persistentDeviceId(): ByteArray {
         val prefs = app.getSharedPreferences("yodrop_identity", Context.MODE_PRIVATE)

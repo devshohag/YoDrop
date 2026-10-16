@@ -1,6 +1,6 @@
 # Current implementation decisions
 
-This file describes the current tree, audited at Step 20. Historical intermediate
+This file describes the current tree, audited at Step 20 and extended by P6/R1. Historical intermediate
 notes remain available in git (`git show 4fb3bd4:docs/DECISIONS.md`) and the older
 STEP*-VALIDATION reports; their pending-work statements are not current status.
 Physical results are recorded separately in MANUAL-TESTS.md and the Step 20 device
@@ -15,9 +15,10 @@ ledger. Build success alone does not complete device acceptance.
 | A3 | Human accept deadline 60 s; receiver CLAIM window 10 s. |
 | A4 | UUID-only advertisements, public five-field OFFER read over GATT, encrypted post-CLAIM preview, one GATT connection/cache, request MTU 247. |
 | A5 | Automatic MediaStore Downloads/YoDrop; no receive-folder prompt. |
+| A6 | Android redesign R1-R3: signed/pinned identities, bounded trusted receiving; R1 keeps explicit Accept, R2 adds deliberate trusted Catch consent. Group stays P10. |
 
-No additional architecture deviation is approved here. Step 20 restores the
-existing §6 nonce layout in code; it does not change the architecture.
+A1-A6 above record the approved scope. Step 20 restored the existing §6 nonce
+layout; R1 adds separate identity/consent control without changing TCP chunk crypto.
 
 ## Step 1 — Android build and real IO wiring
 
@@ -274,3 +275,62 @@ reselection. After handoff the existing app runtime owns transfer sources and
 survives UI recreation. Try gestures is a separate practice mode, requires only
 camera and cannot send files or claim peers. Haptics occur on Grab/Claim, and Done
 adds a short notification tone; system haptic/silent/DND settings are respected.
+
+## R1 — Authenticated trusted pairing (A6 scope)
+
+Owner approved three Android redesign phases before P7-P10. R1 implements the
+identity/trust/receive-window foundation; R2 adds the preview/grab/catch UI, R3
+requires physical two-phone acceptance. No group transfer or implicit Catch
+acceptance is claimed in R1. Existing explicit Accept/Deny remains mandatory.
+
+Implementation choice: platform P-256 ECDSA signing identity in Android Keystore,
+separate from the existing fresh X25519 transfer keys. It is nonexportable via
+our API; hardware backing is device-dependent and is not claimed by JVM tests.
+Public SPKI keys are canonical 91-byte uncompressed secp256r1. Proof signatures
+bind the full session ID, both ephemeral public keys, role and signing identity.
+No new library, dependency upgrade or SDK-level change is required.
+
+HELLO bit 6 negotiates tag 08 encrypted pairing control. Dedicated directional
+HMAC/HKDF expansion labels separate it from TCP, OFFER_DETAILS and LINK_INFO;
+nonce = ASCII PAIRCTL1 + u32 counter, AAD includes role and the full ephemeral
+transcript. A fresh channel has fresh session keys; counters increase per channel
+and fail before overflow. Opposite-role, replay, tamper and cross-session messages
+are rejected. Only authenticated identity and consent bodies are allowed. New
+peers reject plaintext ACCEPT/DENY; legacy peers use manual flow and cannot be
+trusted or admitted to a trusted receive window. A4's five-field public OFFER,
+UUID-only advertising, GATT read/disconnect/cache and fragmentation remain intact.
+
+Trust is local, explicit and separate from transfer acceptance. Both owners
+compare the **full pairing code** (96-bit SHA-256 prefix, six groups of four hex
+digits, binding both signing keys and the ephemeral transcript in canonical role
+order) and confirm separately. The old four-digit transfer code is not sufficient
+for enrollment. Never pin a HELLO name, deviceId or Bluetooth address. A same-name
+replacement key remains unknown and cannot replace an existing pin. A saved trust
+decision survives Deny; Forget explicitly revokes it.
+
+A bounded 32-device registry stores public keys, validated fingerprints and labels.
+Android encrypts its strict versioned CBOR under a separate Keystore AES-256-GCM
+key, with a fresh IV and identity-bound AAD. AtomicFile in noBackupFilesDir commits
+metadata; readback confirms the framework's potentially silent rename failure.
+No private key is serialized. Read/decrypt/write failure disables trusted status;
+mutation first rereads storage and cannot silently replace corrupt records.
+Explicit Reset trusted pairing clears only owned trust metadata/key aliases and
+requires pairing again on both peers; received Downloads are preserved.
+
+A selected pinned sender's receive window lasts 60 seconds on elapsedRealtime.
+CLAIM binds one session, and authentication/Accept recheck target, current pin,
+window token and deadline. Closed/expired windows cannot downgrade into ordinary
+receiving; a separate required-window marker survives revocation until reset.
+Window tokens prevent old callbacks closing a later window. UI pause immediately
+revokes the gate; a string lease prevents old Activity callbacks affecting a new
+one without retaining Activity objects. A timer closes waiting scans/claims/prompts.
+An already consented data transfer continues under the existing foreground service.
+Nothing restores the window from Bundle, disk or process death. The receiver
+identity is encrypted after CLAIM, so an unrelated first discovered peer can cause
+safe refusal/retry; multi-peer targeting/discovery is not solved by this phase.
+
+R1 tests cover actual P-256 signatures, transcript-bound proofs/code, codec/MTU
+fragmentation, counters, registry persistence/failure, receive-window races,
+first-pair/reconnect/key-change/revocation/legacy behavior and authenticated consent
+through real TCP. Android Keystore/BLE/lifecycle evidence remains physical work;
+R1-VALIDATION.md records commands and pending checks without upgrading old results.

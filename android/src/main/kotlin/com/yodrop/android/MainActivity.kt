@@ -11,6 +11,9 @@ import androidx.lifecycle.lifecycleScope
 import com.yodrop.android.transport.hotspot.HotspotProbe
 import com.yodrop.android.transport.hotspot.HotspotProbeScreen
 import com.yodrop.android.ui.MainScreen
+import com.yodrop.android.trust.TrustedPairingPanel
+import com.yodrop.core.trust.PeerIdentityStatus
+import com.yodrop.core.trust.TrustedDevice
 import com.yodrop.android.gesture.GestureCameraPanel
 import com.yodrop.android.gesture.AndroidTransferFeedback
 import com.yodrop.android.storage.PreparedDocuments
@@ -35,6 +38,7 @@ class MainActivity : ComponentActivity() {
     }
 
 
+    private val uiLease = java.util.UUID.randomUUID().toString()
     private var useGestureForSelection = false
     private data class GestureFiles(val token: String, val documents: PreparedDocuments)
     private val staged = kotlinx.coroutines.flow.MutableStateFlow<GestureFiles?>(null)
@@ -116,6 +120,10 @@ class MainActivity : ComponentActivity() {
             val practice by practicing.collectAsState()
             val receiverCamera by receiverGestures.collectAsState()
             val permission by cameraAllowed.collectAsState()
+            val trustedDevices by runtime.trustedDevices.devices.collectAsState()
+            val trustStatus by runtime.trustedDevices.status.collectAsState()
+            val identity by handshake.peerIdentity.collectAsState()
+            val receiveWindow by runtime.trustedPairing.receiveWindow.state.collectAsState()
             val canShowCamera = permission && !preparingFiles && (
                 practice || (gestureFiles != null && senderState is SenderState.Idle && receiverState is ReceiverState.Idle) ||
                     (receiverCamera && (receiverState is ReceiverState.Scanning || receiverState is ReceiverState.OfferSeen)))
@@ -135,6 +143,17 @@ class MainActivity : ComponentActivity() {
                 gestureFileSummary = gestureFiles?.documents?.files?.let { "${it.size} file(s), ${it.sumOf { file -> file.size }} bytes selected" }.orEmpty(),
                 practicingGestures = practice,
                 gesturePanel = { if (canShowCamera) GestureCameraPanel(this@MainActivity, context, ::onGesture) },
+                trustPanel = {
+                    if (!practice && !preparingFiles && gestureFiles == null) TrustedPairingPanel(
+                        trustedDevices, trustStatus, identity, receiveWindow,
+                        idle = senderState is SenderState.Idle && receiverState is ReceiverState.Idle,
+                        mayRemember = senderState is SenderState.AwaitAccept || receiverState is ReceiverState.AcceptPrompt,
+                        onRemember = ::confirmTrust,
+                        onReceive = { fingerprint -> withBlePermissions { launchBleAction { it.startTrustedReceiving(fingerprint) } } },
+                        onForget = ::confirmForget,
+                        onCloseWindow = { runtime.stopTrustedReceiving(it) },
+                        onReset = ::confirmTrustReset)
+                },
                 onSendClick = { chooseFiles(false) },
                 onGestureSendClick = { chooseFiles(true) },
                 onSendPreparedClick = { gestureFiles?.let { files -> withBlePermissions { sendStaged(files.token) } } },
@@ -238,6 +257,34 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         cameraAllowed.value = checkSelfPermission(android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (::runtime.isInitialized) runtime.onUiResumed(uiLease)
+    }
+
+    override fun onPause() {
+        if (::runtime.isInitialized) runtime.onUiPaused(uiLease)
+        super.onPause()
+    }
+
+    private fun confirmTrust(peer: PeerIdentityStatus) {
+        val code = (senderMachine.state.value as? SenderState.AwaitAccept)?.verifyCode
+            ?: (receiverMachine.state.value as? ReceiverState.AcceptPrompt)?.verifyCode ?: return
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Trust this device?")
+            .setMessage("Compare the FULL pairing code on BOTH phones:\n\n${peer.pairingCode}\n\nDevice: ${peer.label}\nTransfer code: $code\n\nEach phone must trust separately. Trust only when the full pairing codes match. Use Accept separately when ready to receive.")
+            .setPositiveButton("Codes match - trust") { _, _ -> launchBleAction { it.rememberPeer(peer.sessionToken) } }
+            .setNegativeButton("Cancel", null).show()
+    }
+    private fun confirmForget(device: TrustedDevice) {
+        android.app.AlertDialog.Builder(this).setTitle("Forget device?")
+            .setMessage("Remove trust for ${device.label}? Future trusted receiving requires pairing again.")
+            .setPositiveButton("Forget") { _, _ -> launchBleAction { it.forgetTrusted(device.fingerprint) } }
+            .setNegativeButton("Cancel", null).show()
+    }
+    private fun confirmTrustReset() {
+        android.app.AlertDialog.Builder(this).setTitle("Reset trusted pairing?")
+            .setMessage("Remove local trusted devices and regenerate this phone's identity. Pair again on both phones. Received downloads are kept.")
+            .setPositiveButton("Reset pairing") { _, _ -> launchBleAction { it.resetTrustedPairing() } }
+            .setNegativeButton("Cancel", null).show()
     }
 
     private fun chooseFiles(gesture: Boolean) = withBlePermissions {

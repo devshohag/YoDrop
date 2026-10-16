@@ -1,5 +1,6 @@
 package com.yodrop.core.session
 
+import com.yodrop.core.trust.PairingChannel
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.crypto.KeyPair
 import com.yodrop.core.crypto.NonceUtils
@@ -53,6 +54,10 @@ class ReceiverStateMachine(
 
     private var myKeyPair: KeyPair? = null
     private var sessionKeys: SessionKeys? = null
+    private var identityChannel: PairingChannel? = null
+    internal suspend fun pairingChannel(): PairingChannel? = eventMutex.withLock {
+        if (_state.value is ReceiverState.Claimed || _state.value is ReceiverState.AcceptPrompt || _state.value is ReceiverState.Linking) identityChannel else null
+    }
     private var activeOffer: OfferMessage? = null
     private var lastLinkInfoCounter = -1L
     private val activeConnections = mutableSetOf<SessionConnection>()
@@ -177,6 +182,7 @@ class ReceiverStateMachine(
         val keys = CryptoEngine.deriveSessionKeys(sharedSecret, offer.sessionId)
         myKeyPair = keyPair
         sessionKeys = keys
+        identityChannel = PairingChannel(keys, offer.sessionId, offer.senderPubKey, keyPair.publicKey, PairingRole.RECEIVER)
         publishLocked(ReceiverState.Claimed)
 
         acceptTimeoutJob = startTimer(timeouts.acceptPromptMs, "Receiver accept prompt timed out") {
@@ -430,6 +436,7 @@ class ReceiverStateMachine(
             activeOffer = null
             lastLinkInfoCounter = -1L
             sessionKeys = null
+            identityChannel = null
             myKeyPair = null
             linksClosed = CompletableDeferred()
             cleanupStarted = false

@@ -14,6 +14,7 @@ object BleMessageType {
     const val DENY = 0x05
     const val LINK_INFO = 0x06
     const val OFFER_DETAILS = 0x07
+    const val PAIRING = 0x08
     const val GATT_PROBE = 0x7f
 }
 
@@ -36,6 +37,8 @@ object BleMessageCodec {
                 cbor.encodeToByteArray(EncryptedOfferDetailsMessage.serializer(), message)
             is EncryptedLinkInfoMessage -> BleMessageType.LINK_INFO to
                 cbor.encodeToByteArray(EncryptedLinkInfoMessage.serializer(), message)
+            is EncryptedPairingMessage -> BleMessageType.PAIRING to
+                cbor.encodeToByteArray(EncryptedPairingMessage.serializer(), message)
             is LinkInfoMessage -> BleMessageType.GATT_PROBE to cbor.encodeToByteArray(LinkInfoMessage.serializer(), message)
         }
         require(payload.size < MAX_MESSAGE_BYTES) { "BLE control message too large" }
@@ -56,6 +59,7 @@ object BleMessageCodec {
                 }
             BleMessageType.OFFER_DETAILS -> cbor.decodeFromByteArray(EncryptedOfferDetailsMessage.serializer(), payload)
             BleMessageType.LINK_INFO -> cbor.decodeFromByteArray(EncryptedLinkInfoMessage.serializer(), payload)
+            BleMessageType.PAIRING -> cbor.decodeFromByteArray(EncryptedPairingMessage.serializer(), payload)
             BleMessageType.GATT_PROBE -> cbor.decodeFromByteArray(LinkInfoMessage.serializer(), payload)
             else -> throw IllegalArgumentException("Unknown BLE message type $type")
         }
@@ -88,6 +92,8 @@ object BleMessageCodec {
                 message.ciphertext.size in 17..OfferDetailsCipher.MAX_CIPHERTEXT_BYTES) { "Invalid encrypted OFFER_DETAILS" }
             is EncryptedLinkInfoMessage -> require(message.counter in 0..LinkInfoCipher.MAX_COUNTER &&
                 message.ciphertext.size in 17..LinkInfoCipher.MAX_CIPHERTEXT_BYTES) { "Invalid encrypted LINK_INFO" }
+            is EncryptedPairingMessage -> require(message.counter in 0..0xffff_ffffL &&
+                message.ciphertext.size in 17..2064) { "Invalid encrypted pairing control" }
             is LinkInfoMessage -> {
                 message.validate()
                 require(GattDiagnosticProbe.isProbe(message) && message.linkType == LinkType.LAN && message.port == 1 &&

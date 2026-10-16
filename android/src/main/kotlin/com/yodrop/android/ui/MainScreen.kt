@@ -31,6 +31,7 @@ fun MainScreen(
     onPracticeClick: () -> Unit = {},
     onReceiverGestureClick: () -> Unit = {},
     gesturePanel: @Composable () -> Unit = {},
+    trustPanel: @Composable () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -48,6 +49,7 @@ fun MainScreen(
         )
 
         gesturePanel()
+        trustPanel()
 
         when {
             practicingGestures -> {

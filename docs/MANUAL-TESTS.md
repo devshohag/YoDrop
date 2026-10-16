@@ -509,3 +509,12 @@ The current tap flow discovers over BLE; same LAN does not replace BLE discovery
 | Multi-file, duplicate/Unicode names, zero-byte file, no overwrite | PENDING |
 | Cancel/preparation rotation/revoked file/low-storage error cleanup | PENDING |
 | LAN drop/resume, then no retained service/locks/staging | PENDING |
+
+
+## Android redesign R1: signed identities and trusted receive
+
+Status: **PENDING — no physical R1 result recorded.**
+Use [R1-VALIDATION.md](R1-VALIDATION.md) for first-pair/full-code confirmation on
+both devices, restart/persistence, same-name key change, selected-target denial,
+Forget/Reset, receive-window expiry/background/rotation and tap/legacy regressions.
+Existing Step 12-20 and P6 physical results remain pending until actually run.

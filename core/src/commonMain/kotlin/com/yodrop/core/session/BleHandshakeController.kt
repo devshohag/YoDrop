@@ -1,7 +1,9 @@
 package com.yodrop.core.session
 
 import com.yodrop.core.protocol.*
+import com.yodrop.core.trust.*
 import com.yodrop.core.transport.TransportSelection
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
@@ -20,6 +22,7 @@ class BleHandshakeController(
     private val helloSnapshot: (() -> HelloMessage)? = null,
     private val onOfferRead: (suspend (String, OfferMessage) -> Unit)? = null,
     private val connectForClaim: (suspend (String, OfferMessage) -> Unit)? = null,
+    private val trustedPairing: TrustedPairing? = null,
     private val send: suspend (String, BleControlMessage) -> Unit
 ) {
     private val mutex = Mutex()
@@ -30,13 +33,47 @@ class BleHandshakeController(
     val peerName = _peerName.asStateFlow()
     private val _selection = MutableStateFlow<TransportSelection?>(null)
     val selection = _selection.asStateFlow()
+    private val _peerIdentity = MutableStateFlow<PeerIdentityStatus?>(null)
+    val peerIdentity = _peerIdentity.asStateFlow()
+    private class Pending(val peer: String, val channel: PairingChannel, val window: ReceiveWindow?) {
+        var proof: PairingControl.Identity? = null
+        var localPublicKey: ByteArray? = null
+    }
+    private var pending: Pending? = null
+
+    private fun negotiatesTrust(peer: HelloMessage?) = trustedPairing != null && peer != null &&
+        localHello.capabilities and DeviceCaps.CAP_TRUSTED_PAIRING != 0 &&
+        peer.capabilities and DeviceCaps.CAP_TRUSTED_PAIRING != 0
+
+    private suspend fun current(p: Pending): Boolean = pending === p &&
+        (if (p.channel.role == PairingRole.SENDER) sender.pairingChannel() else receiver.pairingChannel()) === p.channel
+
+    private suspend fun beginIdentity(peer: String, channel: PairingChannel, window: ReceiveWindow? = null): Boolean {
+        val trust = trustedPairing ?: return false
+        val p = Pending(peer, channel, window); pending = p; _peerIdentity.value = null
+        return try {
+            val publicKey = trust.identity.publicKey()
+            p.localPublicKey = publicKey.copyOf()
+            val proof = PairingControl.Identity(publicKey.copyOf(), trust.identity.sign(channel.identityTranscript(publicKey)))
+            check(IdentitySignatures.verify(publicKey, channel.identityTranscript(publicKey), proof.signature))
+            if (!current(p)) return false
+            if (p.window != null && !trust.receiveWindow.isLive(p.window)) { rejectPairing(p); return false }
+            send(peer, channel.seal(proof)); true
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { rejectPairing(p); false }
+    }
+    private suspend fun rejectPairing(p: Pending) {
+        _peerIdentity.value = null
+        p.window?.let { trustedPairing?.receiveWindow?.close(it.token) }
+        if (p.channel.role == PairingRole.SENDER) sender.cancel("Device identity authentication failed")
+        else receiver.cancel("Device identity/receive-window authentication failed")
+    }
 
     suspend fun onMessage(event: BlePeerMessage): Boolean = mutex.withLock {
         val (peer, message) = event
         when (message) {
             is HelloMessage -> {
                 if (message.deviceId.size != 16 || peer.isBlank()) return@withLock false
-                // Bound unclaimed discovery metadata; this is a single-receiver flow.
                 if (peer !in hellos && hellos.size >= 16) return@withLock false
                 hellos[peer] = message.copy(deviceId = message.deviceId.copyOf())
                 val advertising = sender.state.value as? SenderState.Grabbed
@@ -57,29 +94,48 @@ class BleHandshakeController(
             is ClaimMessage -> {
                 val hello = hellos[peer] ?: return@withLock false
                 if (!sender.onClaimReceived(message)) return@withLock false
-                sender.createEncryptedOfferDetails()?.let { send(peer, it) }
                 claimedPeer = peer
                 _peerName.value = hello.deviceName
                 _selection.value = selectTransport?.invoke(hello) ?: sender.selectTransport(
                     localHello.platform, localHello.capabilities, hello)
+                if (negotiatesTrust(hello) && !beginIdentity(peer, checkNotNull(sender.pairingChannel()))) return@withLock false
+                sender.createEncryptedOfferDetails()?.let { send(peer, it) }
                 true
+            }
+            is EncryptedPairingMessage -> {
+                val p = pending ?: return@withLock false
+                if (peer != p.peer || !current(p)) return@withLock false
+                try {
+                    when (val body = p.channel.open(message)) {
+                        is PairingControl.Identity -> {
+                            check(p.proof == null && p.channel.verifies(body))
+                            val fingerprint = IdentityKeys.fingerprint(body.publicKey)
+                            val trust = checkNotNull(trustedPairing)
+                            val saved = trust.registry.find(fingerprint)
+                            if (!current(p)) return@withLock false
+                            if (p.window != null) check(saved != null && trust.receiveWindow.permits(p.window, p.channel.token, fingerprint))
+                            p.proof = body.copy(publicKey = body.publicKey.copyOf(), signature = body.signature.copyOf())
+                            _peerIdentity.value = PeerIdentityStatus(p.channel.token, fingerprint, saved?.label ?: _peerName.value ?: "Nearby device", saved != null,
+                                p.channel.trustCode(checkNotNull(p.localPublicKey), body.publicKey))
+                            true
+                        }
+                        is PairingControl.Consent -> {
+                            check(p.channel.role == PairingRole.SENDER && p.proof != null)
+                            processDecision(peer, DecisionMessage(p.channel.sessionId.copyOf(), body.accepted, body.reason))
+                        }
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { rejectPairing(p); false }
             }
             is DecisionMessage -> {
-                if (peer != claimedPeer) return@withLock false
-                // Sender-owned endpoint setup follows explicit consent; no receiver-fabricated IP.
-                if (!sender.onDecisionReceived(message)) return@withLock false
-                if (message.accepted && prepareLink != null) {
-                    val choice = _selection.value ?: TransportSelection.Unavailable
-                    val link = prepareLink.invoke(checkNotNull(hellos[peer]), choice)
-                    if (link != null) {
-                        check(choice is TransportSelection.DataLink && choice.linkType == link.linkType)
-                        sender.createEncryptedLinkInfo(link)?.let { send(peer, it) }
-                    }
-                }
-                true
+                if (pending?.peer == peer) return@withLock false // Negotiated peers must authenticate consent.
+                processDecision(peer, message)
             }
             is EncryptedOfferDetailsMessage -> {
-                peer == offerPeer && receiver.onEncryptedOfferDetailsReceived(message)
+                val p = pending
+                if (peer != offerPeer) return@withLock false
+                if (p != null && p.proof == null) { rejectPairing(p); return@withLock false }
+                receiver.onEncryptedOfferDetailsReceived(message)
             }
             is EncryptedLinkInfoMessage -> {
                 if (peer != offerPeer) return@withLock false
@@ -87,49 +143,101 @@ class BleHandshakeController(
                 onLinkReady?.invoke(link)
                 true
             }
-            is LinkInfoMessage -> false // Plaintext is diagnostic-only and never a session endpoint.
+            is LinkInfoMessage -> false
         }
+    }
+
+    private suspend fun processDecision(peer: String, message: DecisionMessage): Boolean {
+        if (peer != claimedPeer || !sender.onDecisionReceived(message)) return false
+        if (message.accepted && prepareLink != null) {
+            val choice = _selection.value ?: TransportSelection.Unavailable
+            val link = prepareLink.invoke(checkNotNull(hellos[peer]), choice)
+            if (link != null) {
+                check(choice is TransportSelection.DataLink && choice.linkType == link.linkType)
+                sender.createEncryptedLinkInfo(link)?.let { send(peer, it) }
+            }
+        }
+        return true
     }
 
     suspend fun claim(): Boolean = mutex.withLock {
         val peer = offerPeer ?: return@withLock false
-        if (receiver.state.value !is ReceiverState.OfferSeen) return@withLock false
-        val offer = (receiver.state.value as ReceiverState.OfferSeen).offer
+        val offer = (receiver.state.value as? ReceiverState.OfferSeen)?.offer ?: return@withLock false
+        val trustWindow = trustedPairing?.requiredWindow
+        if (trustWindow != null && !negotiatesTrust(hellos[peer])) {
+            trustedPairing?.receiveWindow?.close(trustWindow.token)
+            receiver.cancel("Selected trusted device does not support authenticated pairing")
+            return@withLock false
+        }
         val claim = receiver.claimOffer()
         try {
+            val channel = checkNotNull(receiver.pairingChannel())
+            val bound = if (trustWindow != null) trustedPairing?.receiveWindow?.bind(channel.token) else null
+            if (trustWindow != null && bound == null) {
+                receiver.cancel("Trusted receive window expired"); return@withLock false
+            }
             connectForClaim?.invoke(peer, offer)
+            if (receiver.state.value !is ReceiverState.Claimed || (bound != null && trustedPairing?.receiveWindow?.isLive(bound) != true)) {
+                receiver.cancel("Claim/receive window expired before reconnect completed"); return@withLock false
+            }
             send(peer, claim)
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            receiver.cancel("Claim cancelled")
-            throw cancelled
+            if (negotiatesTrust(hellos[peer]) && !beginIdentity(peer, channel, bound)) return@withLock false
+        } catch (cancelled: CancellationException) {
+            receiver.cancel("Claim cancelled"); throw cancelled
         } catch (failure: Exception) {
-            receiver.cancel("Could not reconnect to sender")
-            throw failure
+            receiver.cancel("Could not reconnect to sender"); throw failure
         }
         true
+    }
+
+    /** The caller's explicit code-match confirmation is bound to this proof and live prompt. */
+    suspend fun rememberPeer(sessionToken: String): Boolean = mutex.withLock {
+        val p = pending ?: return@withLock false
+        val status = _peerIdentity.value ?: return@withLock false
+        if (sessionToken != p.channel.token || status.sessionToken != sessionToken || !current(p) ||
+            (sender.state.value !is SenderState.AwaitAccept && receiver.state.value !is ReceiverState.AcceptPrompt)) return@withLock false
+        val proof = p.proof ?: return@withLock false
+        val saved = trustedPairing?.registry?.remember(proof.publicKey, status.label) == true
+        if (saved) _peerIdentity.value = status.copy(trusted = true)
+        saved
+    }
+    suspend fun refreshPeerTrust() = mutex.withLock {
+        val status = _peerIdentity.value ?: return@withLock
+        _peerIdentity.value = status.copy(trusted = trustedPairing?.registry?.find(status.fingerprint) != null)
     }
 
     suspend fun accept(): Boolean = mutex.withLock {
         val peer = offerPeer ?: return@withLock false
         if (receiver.state.value !is ReceiverState.AcceptPrompt) return@withLock false
-        send(peer, receiver.acceptTransfer())
+        val p = pending
+        if (p != null && (p.proof == null || !current(p))) return@withLock false
+        val fingerprint = p?.proof?.let { IdentityKeys.fingerprint(it.publicKey) }
+        if (p?.window != null && (fingerprint == null || trustedPairing?.registry?.find(fingerprint) == null ||
+                trustedPairing.receiveWindow.permits(p.window, p.channel.token, fingerprint).not())) {
+            rejectPairing(p); return@withLock false
+        }
+        val decision = receiver.acceptTransfer()
+        if (p?.window != null && !checkNotNull(trustedPairing).receiveWindow.consume(p.window, p.channel.token, checkNotNull(fingerprint))) {
+            rejectPairing(p); return@withLock false
+        }
+        send(peer, if (p != null) p.channel.seal(PairingControl.Consent(true)) else decision)
         true
     }
 
     suspend fun deny(): Boolean = mutex.withLock {
         val peer = offerPeer ?: return@withLock false
         val prompt = receiver.state.value as? ReceiverState.AcceptPrompt ?: return@withLock false
-        // Finish the bounded GATT write before terminal-state observers close the BLE link.
-        send(peer, DecisionMessage(prompt.offer.sessionId.copyOf(), false, "User declined"))
+        val p = pending
+        send(peer, if (p != null) p.channel.seal(PairingControl.Consent(false, "User declined"))
+            else DecisionMessage(prompt.offer.sessionId.copyOf(), false, "User declined"))
+        p?.window?.let { trustedPairing?.receiveWindow?.close(it.token) }
         receiver.denyTransfer("User declined")
         true
     }
 
     suspend fun reset() = mutex.withLock {
-        offerPeer = null
-        claimedPeer = null
-        hellos.clear()
-        _peerName.value = null
-        _selection.value = null
+        offerPeer = null; claimedPeer = null; pending = null
+        hellos.clear(); _peerName.value = null; _selection.value = null; _peerIdentity.value = null
+        trustedPairing?.clearReceiveSession()
     }
 }

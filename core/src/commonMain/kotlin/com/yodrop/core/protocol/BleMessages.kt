@@ -25,10 +25,20 @@ object DeviceCaps {
     const val CAP_HOTSPOT_CLIENT = 1 shl 3
     const val CAP_LAN = 1 shl 4
     const val CAP_MPC = 1 shl 5
+    const val CAP_TRUSTED_PAIRING = 1 shl 6
 }
 
 @Serializable
 sealed interface BleControlMessage
+
+@Serializable
+enum class PairingRole { SENDER, RECEIVER }
+
+@OptIn(ExperimentalSerializationApi::class)
+@Serializable
+data class EncryptedPairingMessage(val role: PairingRole, val counter: Long, @ByteString val ciphertext: ByteArray) : BleControlMessage {
+    override fun toString() = "EncryptedPairingMessage(role=$role, counter=$counter, ciphertext=<redacted>)"
+}
 
 @Serializable
 data class HelloMessage(
