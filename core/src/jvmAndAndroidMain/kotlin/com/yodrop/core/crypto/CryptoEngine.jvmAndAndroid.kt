@@ -68,7 +68,7 @@ actual object CryptoEngine {
     actual fun deriveSessionKeys(sharedSecret: ByteArray, sessionId: ByteArray): SessionKeys {
         val s2rKey = hkdfExpand(sharedSecret, sessionId, "YoDrop-S2R-AES-GCM".encodeToByteArray(), 32)
         val r2sKey = hkdfExpand(sharedSecret, sessionId, "YoDrop-R2S-AES-GCM".encodeToByteArray(), 32)
-        val nonceBase = hkdfExpand(sharedSecret, sessionId, "YoDrop-Nonce-Base".encodeToByteArray(), 12)
+        val nonceBase = hkdfExpand(sharedSecret, sessionId, "YoDrop-Nonce-Base".encodeToByteArray(), 8)
         val verifyCode = VerifyCode.fromHash(sha256(sharedSecret))
 
         return SessionKeys(

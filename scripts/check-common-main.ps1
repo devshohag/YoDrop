@@ -5,7 +5,7 @@ $commonRoot = Join-Path $projectRoot "core/src/commonMain"
 
 $violations = @(
     Get-ChildItem $commonRoot -Recurse -Filter "*.kt" |
-        Select-String -Pattern '\bjava\.|\bjavax\.|\bsynchronized\s*\(|\brunBlocking\b'
+        Select-String -Pattern '\bjava\.|\bjavax\.|\bsynchronized\s*\(|\brunBlocking\b|\.format\s*\('
 )
 
 if ($violations.Count -gt 0) {

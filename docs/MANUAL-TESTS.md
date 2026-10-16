@@ -2,6 +2,50 @@
 
 Do not infer any physical Android result from JVM tests or an APK build.
 
+## Step 20 acceptance gate and result recording
+
+As of the Step 20 audit, **no physical result has been supplied**. All previous
+PENDING rows remain pending. Record actual model/API, peer model/API, date/time,
+tested commit, APK SHA-256, observed result and a nonsensitive log/hash reference
+in STEP20-DEVICE-RESULTS.csv and the applicable checklist below. Use PASS/FAIL/
+BLOCKED only after running a test; fill the device/evidence fields for each result.
+No camera frames, SSIDs/passphrases, personal documents or sensitive previews in
+shared evidence. A blank/PENDING field cannot be counted as acceptance.
+
+First run the owner build/evidence script:
+
+```powershell
+& .\scripts\validate-step20.ps1 -TempDirectory D:\Temp
+Get-Content .\build\reports\step20\OWNER-VALIDATION.md
+```
+
+It captures clean JVM/app/instrumentation-APK build output, test XML totals,
+acceptance markers, source/merged-manifest checks, actual history and APK hashes.
+It refuses empty/skipped/missing required suites and never executes/marks a
+physical test. Install the new normal app APK on **both peers** because Step 20
+restores the spec's TCP chunk nonce layout. Old/new APKs cannot exchange chunks.
+
+For the outstanding API 29 X25519 check, use a real API 29 emulator/device only.
+The runner is a custom Instrumentation (no new test dependency):
+
+```powershell
+$api29 = 'API29_SERIAL'
+adb -s $api29 shell getprop ro.build.version.sdk
+# Must print 29; running this on API 34 does not satisfy API 29 acceptance.
+adb -s $api29 install -r .\core\build\outputs\apk\androidTest\debug\core-debug-androidTest.apk
+adb -s $api29 shell am instrument -w com.yodrop.core.test/com.yodrop.core.crypto.X25519Instrumentation
+```
+
+Require `X25519: 7 checks PASSED; API 29`, checksPassed=7 and the successful
+instrumentation result, not merely APK installation. Preserve the output. Those
+seven checks cover RFC 7748 vectors, Alice/Bob agreement, high-bit equivalence,
+low-order rejection and input bounds. JVM results do not substitute for this run.
+
+Then execute all applicable Step 12-19 rows below, plus receive smoke/permission
+denial on API 29/31/34. Final acceptance requires actual matching BLE codes, GATT
+MTUs, WFD throughput/resume, LAN/hash and foreground evidence. Passing just the
+owner script leaves physical acceptance pending. P6-P10 are not started here.
+
 ## Step 12: BLE discovery, tap CLAIM and verification code
 
 Status: **PENDING - not executed on physical devices.**

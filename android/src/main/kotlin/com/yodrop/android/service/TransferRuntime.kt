@@ -12,10 +12,12 @@ import com.yodrop.android.storage.AndroidFileStorage
 import com.yodrop.android.transport.*
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.platform.FileSource
+import com.yodrop.core.platform.DiskResumeStore
 import com.yodrop.core.protocol.*
 import com.yodrop.core.session.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import java.io.File
 
 /** Process/session ownership, independent of Activity lifecycle. No Activity is retained. */
 class TransferRuntime private constructor(context: Context) {
@@ -42,7 +44,8 @@ class TransferRuntime private constructor(context: Context) {
         }
     })
     val sender = SenderStateMachine(scope, onCleanup = { senderLink.close() })
-    val receiver = ReceiverStateMachine(scope, sinkFactory = AndroidFileStorage(app)::createScopedStorageFileSink,
+    val receiver = ReceiverStateMachine(scope, resumeStore = DiskResumeStore(File(app.filesDir, "resume")),
+        sinkFactory = AndroidFileStorage(app)::createScopedStorageFileSink,
         onCleanup = { receiverLink.close() })
     val ble: AndroidBleManager
     val handshake: BleHandshakeController

@@ -10,7 +10,14 @@ class InMemoryResumeStore : ResumeStore {
     private val store = mutableMapOf<String, ByteArray>()
 
     private fun key(sessionId: ByteArray, fileId: String): String {
-        return sessionId.joinToString("") { "%02x".format(it) } + "_" + fileId
+        val hex = "0123456789abcdef"
+        return buildString(sessionId.size * 2 + 1 + fileId.length) {
+            for (byte in sessionId) {
+                val value = byte.toInt() and 0xff
+                append(hex[value ushr 4]); append(hex[value and 15])
+            }
+            append('_'); append(fileId)
+        }
     }
 
     override suspend fun loadBitmap(sessionId: ByteArray, fileId: String, totalChunks: Int): ChunkBitmap {

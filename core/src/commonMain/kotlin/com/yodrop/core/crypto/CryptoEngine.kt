@@ -35,19 +35,11 @@ object NonceUtils {
     }
 
     fun buildChunkNonce(nonceBase: ByteArray, chunkIndex: Int, attemptCounter: Int): ByteArray {
-        require(nonceBase.size >= 4) { "nonceBase must be at least 4 bytes" }
-        val nonce = ByteArray(12)
-        nonceBase.copyInto(nonce, 0, 0, 4)
-        nonce[4] = ((chunkIndex shr 24) and 0xFF).toByte()
-        nonce[5] = ((chunkIndex shr 16) and 0xFF).toByte()
-        nonce[6] = ((chunkIndex shr 8) and 0xFF).toByte()
-        nonce[7] = (chunkIndex and 0xFF).toByte()
-
-        nonce[8] = ((attemptCounter shr 24) and 0xFF).toByte()
-        nonce[9] = ((attemptCounter shr 16) and 0xFF).toByte()
-        nonce[10] = ((attemptCounter shr 8) and 0xFF).toByte()
-        nonce[11] = (attemptCounter and 0xFF).toByte()
-        return nonce
+        require(chunkIndex >= 0 && attemptCounter >= 0) { "Invalid chunk nonce counter" }
+        // ARCHITECTURE §6: 8-byte session prefix + global per-direction counter.
+        // Sender's lifetime-monotonic allocator covers all files, sockets and retries;
+        // the chunk index remains authenticated in AAD, not embedded in this nonce.
+        return build12ByteNonce(nonceBase, attemptCounter)
     }
 
     fun buildAad(sessionId: ByteArray, fileId: String, chunkIndex: Int): ByteArray {
