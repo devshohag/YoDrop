@@ -62,10 +62,11 @@ class Step7LifecycleTest {
         val file = FileMeta("file", "file.dat", bytes.size.toLong(),
             "application/octet-stream", CryptoEngine.sha256(bytes))
         assertTrue(sender.onGrabbed(listOf(file), mapOf("file" to r.source)))
-        val offer = assertIs<SenderState.Advertising>(sender.state.value).offer
+        val offer = assertIs<SenderState.Grabbed>(sender.state.value).offer
         receiver.startScanning()
         receiver.onOfferDiscovered(offer)
         sender.onClaimReceived(receiver.claimOffer())
+        receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
         receiver.state.first { it is ReceiverState.AcceptPrompt }
         sender.onDecisionReceived(receiver.acceptTransfer(link), link)
         return Fixture(sender, receiver, r, store, offer.sessionId)
@@ -335,8 +336,9 @@ class Step7LifecycleTest {
                     CryptoEngine.sha256(bytes))
                 sender.onGrabbed(listOf(file), mapOf("file" to MemoryFileSource("file", bytes)))
                 receiver.startScanning()
-                receiver.onOfferDiscovered(assertIs<SenderState.Advertising>(sender.state.value).offer)
+                receiver.onOfferDiscovered(assertIs<SenderState.Grabbed>(sender.state.value).offer)
                 sender.onClaimReceived(receiver.claimOffer())
+                receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
                 receiver.state.first { it is ReceiverState.AcceptPrompt }
                 sender.onDecisionReceived(receiver.acceptTransfer(link), link)
                 val accepted = async { server.accept() }

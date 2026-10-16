@@ -1,4 +1,4 @@
-﻿package com.yodrop.core
+package com.yodrop.core
 
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.protocol.*
@@ -42,13 +42,13 @@ class Phase3BleTests {
             senderPubKey = aliceKey.publicKey,
             fileCount = 3,
             totalBytes = 1024 * 1024 * 15,
-            previewName = "vacation_photos.zip"
+            senderName = "vacation_photos.zip"
         )
 
         val encoded = ProtocolCodec.cbor.encodeToByteArray(OfferMessage.serializer(), offer)
         val decoded = ProtocolCodec.cbor.decodeFromByteArray(OfferMessage.serializer(), encoded)
 
-        assertEquals("vacation_photos.zip", decoded.previewName)
+        assertEquals("vacation_photos.zip", decoded.senderName)
         assertEquals(3, decoded.fileCount)
         assertTrue(decoded.senderPubKey.contentEquals(aliceKey.publicKey))
     }

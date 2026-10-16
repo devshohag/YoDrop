@@ -106,11 +106,13 @@ class MainActivity : ComponentActivity() {
             .takeIf { it in 23..517 } ?: 247 else 247
         ble = AndroidBleManager(this, lifecycleScope, hello, requestedMtu = bleMtu,
             diagnosticsEnabled = debug && intent.getBooleanExtra("yodrop_gatt_probe", false),
-            helloSnapshot = helloSnapshot)
+            helloSnapshot = helloSnapshot, senderState = { senderMachine.state.value })
         handshake = BleHandshakeController(senderMachine, receiverMachine, hello,
             selectTransport = { peer -> selector.selectTransport(hello.capabilities, peer, peer.lanIp) },
             prepareLink = { _, choice -> senderLinkSetup.prepare(choice) },
             helloSnapshot = helloSnapshot,
+            onOfferRead = { peer, offer -> ble.offerRead(peer, offer) },
+            connectForClaim = { peer, offer -> ble.connectForClaim(peer, offer) },
             onLinkReady = { link ->
                 if (link.linkType == LinkType.LAN) {
                     val connection = LanTransport().connect(link)
@@ -135,8 +137,10 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             senderMachine.state.collect { state ->
                 try {
-                    if (state is SenderState.Advertising) ble.startAdvertising(state.offer)
+                    if (state is SenderState.Grabbed) ble.startAdvertising(state)
                     else ble.stopAdvertising()
+                    if (state is SenderState.Done || state is SenderState.Cancelled ||
+                        (state is SenderState.Failed && !state.canResume)) ble.close()
                 } catch (_: SecurityException) { showBleError() }
             }
         }
@@ -144,6 +148,8 @@ class MainActivity : ComponentActivity() {
             receiverMachine.state.collect { state ->
                 try {
                     if (state !is ReceiverState.Scanning) ble.stopScanning()
+                    if (state is ReceiverState.Done || state is ReceiverState.Cancelled ||
+                        (state is ReceiverState.Failed && !state.canResume)) ble.close()
                 } catch (_: SecurityException) { showBleError() }
             }
         }
@@ -320,7 +326,8 @@ class MainActivity : ComponentActivity() {
 
                 handedOff = senderMachine.onGrabbed(
                     listOf(meta),
-                    mapOf(meta.id to diskSource)
+                    mapOf(meta.id to diskSource),
+                    senderName = Build.MODEL.ifBlank { "Android" }.take(64)
                 )
             } catch (e: CancellationException) {
                 throw e

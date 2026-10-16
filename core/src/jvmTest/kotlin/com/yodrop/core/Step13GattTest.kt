@@ -257,14 +257,14 @@ class Step13GattTest {
     fun discoveryPinsPeerAndSessionAndCopiesTheAdvertisement() {
         val target = BleDiscoveryTarget()
         val sid = ByteArray(16) { 7 }
-        assertFalse(target.select("a", ByteArray(15)))
-        assertTrue(target.select("a", sid))
+        assertFalse(target.bindSession("a", ByteArray(15)))
+        assertTrue(target.select("a") && target.bindSession("a", sid))
         sid[0] = 8
         assertTrue(target.matches("a", ByteArray(16) { 7 }))
-        assertFalse(target.select("b", ByteArray(16) { 7 }))
-        assertFalse(target.select("a", ByteArray(16) { 8 }))
+        assertFalse(target.select("b"))
+        assertFalse(target.bindSession("a", ByteArray(16) { 8 }))
         target.clear()
-        assertTrue(target.select("b", ByteArray(16) { 8 }))
+        assertTrue(target.select("b") && target.bindSession("b", ByteArray(16) { 8 }))
     }
 
     @Test

@@ -40,7 +40,7 @@ YoDrop/
 
 ## 4. Flow
 ```
-Sender: select file → open camera → ✋ palm → ✊ fist = GRABBED (haptic) → BLE advertise OFFER
+Sender: select file → open camera → ✋ palm → ✊ fist = GRABBED (haptic) → BLE advertise service UUID (read OFFER over GATT)
 Receiver: app open, scanning → sees OFFER → 🖐 open palm (fist→palm) within 10s = CLAIM
 → Accept prompt (sender name + file summary + 4-digit verify code)
 → link setup → encrypted TCP transfer → verify hash → DONE (haptic + sound)
@@ -51,15 +51,34 @@ Receiver: app open, scanning → sees OFFER → 🖐 open palm (fist→palm) wit
 ## 5. Protocol
 
 ### 5.1 BLE phase (control, small)
-GATT service UUID: generate once, store in `core/protocol/Uuids.kt`. One write characteristic + one notify characteristic. Messages are fragmented to MTU (header: `msgId u16, frag u8, total u8`).
+GATT service UUID: random 128-bit UUID generated once, stored in `core/protocol/Uuids.kt`. Approved A4: discover by this service UUID only; no sessionId, filename, local name or service data in advertisements/scan responses. One write characteristic + one notify characteristic. Messages are fragmented to MTU (header: `msgId u16, frag u8, total u8`).
 
 | Msg | Dir | Fields |
 |---|---|---|
 | HELLO | both | deviceId (16B), name, platform, caps bitmask (WIFI_DIRECT, HOTSPOT_HOST, LAN, MPC, AWARE) |
-| OFFER | S→R | sessionId (16B), senderPubKey (X25519 32B), fileCount, totalBytes, previewName |
+| OFFER | S→R (plain GATT) | sessionId (16B), senderPubKey (X25519 32B), senderName, fileCount, totalBytes |
 | CLAIM | R→S | sessionId, receiverPubKey (32B) |
+| OFFER_DETAILS (0x07) | S→R (encrypted after CLAIM/ECDH) | previewName; outer envelope counter + ciphertext |
 | ACCEPT / DENY | R→S | sessionId, reason |
 | LINK_INFO | S→R (encrypted) | linkType, ssid?, passphrase?, ip, port |
+
+Approved A4 discovery lifecycle:
+- Advertise only while sender is `GRABBED` (including tap fallback); stop on CLAIM,
+  every terminal state and the 60-second OFFER deadline. `Grabbed(offer)` replaces
+  the former transient Grabbed + Advertising states.
+- A single service-only legacy advertisement fits 21 bytes including Flags; scan
+  response is empty. This intentionally replaces Step 15's former sessionId hint.
+- One active GATT connection at a time. On discovery, obtain the full public OFFER
+  over the existing HELLO/write -> OFFER/notify exchange, with fragmentation.
+  Cache bounded public offers by peer/session; disconnect after reading without
+  claiming. An explicit tap reconnects the same peer/session for CLAIM.
+- Android requests MTU 247 after connection, retaining fragmentation using the
+  actual negotiated MTU (default 23 fallback). Debug-only MTU probes can request 23.
+- Receiver stays CLAIMED until authenticated OFFER_DETAILS supplies previewName;
+  only then show the accept prompt. The 60-second post-CLAIM timer bounds waiting
+  for details and acceptance. LINK_INFO still follows explicit ACCEPT.
+- Future iOS sender advertises only this service UUID while foreground; no service
+  data support is required. This does not implement iOS or background discovery.
 
 Verify code = first 4 digits of SHA-256(sharedSecret) shown on both screens.
 
@@ -102,7 +121,7 @@ Frame: `[u32 length][u8 type][payload]`, big-endian. Control payloads = kotlinx.
 `Transport` interface (commonMain): `connect(linkInfo): Connection`, `listen(): Connection`, `Connection.read/write/close`.
 
 ## 8. State machines
-Sender: `IDLE → GRABBED → ADVERTISING → CLAIMED → AWAIT_ACCEPT → LINKING → AUTH → TRANSFERRING → DONE | FAILED | CANCELLED`
+Sender: `IDLE → GRABBED (advertising) → CLAIMED → AWAIT_ACCEPT → LINKING → AUTH → TRANSFERRING → DONE | FAILED | CANCELLED`
 Receiver: `IDLE → SCANNING → OFFER_SEEN → CLAIMED → ACCEPT_PROMPT → LINKING → AUTH → RECEIVING → VERIFYING → DONE | FAILED | CANCELLED`
 Timeouts: OFFER 60s, CLAIM window 10s, LINKING 20s, idle socket 15s (PING every 5s). Every failure → clean up link (remove WFD group / stop hotspot).
 
@@ -139,3 +158,11 @@ The JVM/Android CryptoEngine actual lives in jvmAndAndroidMain.
 Receiver CLAIM window is 10 seconds from OFFER_SEEN.
 The human verification/accept prompt has a separate 60-second timeout on
 both sides. LINKING remains 20 seconds and socket read idle remains 15 seconds.
+
+## Approved A4 — 2026-10-16
+Owner approved service-UUID-only discovery and full OFFER over GATT, with the four
+conditions implemented in §5.1: Grabbed-only advertising with 60-second/session-end
+stop, public OFFER limited to five fields and encrypted post-CLAIM previewName,
+one GATT connection with per-session cache/read-disconnect, and Android MTU 247
+request with fragmentation. Both APKs must update together for the new UUIDs and
+OFFER/OFFER_DETAILS wire schema.

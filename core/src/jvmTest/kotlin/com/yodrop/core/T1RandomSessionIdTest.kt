@@ -22,7 +22,7 @@ class T1RandomSessionIdTest {
         for (i in 0 until count) {
             val sm = SenderStateMachine(scope)
             sm.onGrabbed(listOf(dummyFile), emptyMap())
-            val adv = sm.state.value as SenderState.Advertising
+            val adv = sm.state.value as SenderState.Grabbed
             val sidHex = adv.offer.sessionId.joinToString("") { "%02x".format(it) }
             assertEquals(16, adv.offer.sessionId.size, "SessionId must be exactly 16 bytes")
             set.add(sidHex)

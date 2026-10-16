@@ -1,4 +1,4 @@
-﻿package com.yodrop.core.protocol
+package com.yodrop.core.protocol
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.ExperimentalSerializationApi
@@ -45,7 +45,7 @@ data class OfferMessage(
     val senderPubKey: ByteArray,
     val fileCount: Int,
     val totalBytes: Long,
-    val previewName: String
+    val senderName: String
 ) : BleControlMessage
 
 @Serializable
@@ -89,4 +89,20 @@ data class EncryptedLinkInfoMessage(
     @ByteString val ciphertext: ByteArray
 ) : BleControlMessage {
     override fun toString() = "EncryptedLinkInfoMessage(counter=$counter, ciphertext=<redacted>)"
+}
+
+
+@Serializable
+data class OfferDetails(val previewName: String) {
+    fun validate() { require(previewName.encodeToByteArray().size in 1..1024) { "Invalid preview name" } }
+    override fun toString() = "OfferDetails(previewName=<redacted>)"
+}
+
+@OptIn(ExperimentalSerializationApi::class)
+@Serializable
+data class EncryptedOfferDetailsMessage(
+    val counter: Long,
+    @ByteString val ciphertext: ByteArray
+) : BleControlMessage {
+    override fun toString() = "EncryptedOfferDetailsMessage(counter=$counter, ciphertext=<redacted>)"
 }

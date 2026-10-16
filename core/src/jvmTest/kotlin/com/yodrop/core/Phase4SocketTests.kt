@@ -58,12 +58,13 @@ class Phase4SocketTests {
         val receiver = ReceiverStateMachine(scope, sinkFactory = { DiskFileSink(it.id, dstFile) })
 
         sender.onGrabbed(listOf(meta), mapOf(meta.id to source))
-        val offer = (sender.state.value as SenderState.Advertising).offer
+        val offer = (sender.state.value as SenderState.Grabbed).offer
 
         receiver.startScanning()
         receiver.onOfferDiscovered(offer)
         val claim = receiver.claimOffer()
         sender.onClaimReceived(claim)
+        receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
 
         val linkInfo = LinkInfoMessage(LinkType.WIFI_DIRECT, "127.0.0.1", port)
         receiver.state.first { it is ReceiverState.AcceptPrompt }

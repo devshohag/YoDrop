@@ -71,12 +71,13 @@ class T5StreamingFileIoTest {
             val receiver = ReceiverStateMachine(this, sinkFactory = { DiskFileSink(it.id, dstFile) })
 
             sender.onGrabbed(listOf(meta), mapOf(meta.id to source))
-            val adv = sender.state.value as SenderState.Advertising
+            val adv = sender.state.value as SenderState.Grabbed
 
             receiver.startScanning()
             receiver.onOfferDiscovered(adv.offer)
             val claim = receiver.claimOffer()
             sender.onClaimReceived(claim)
+            receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
 
             val linkInfo = LinkInfoMessage(LinkType.LAN, "127.0.0.1", port)
             receiver.state.first { it is ReceiverState.AcceptPrompt }

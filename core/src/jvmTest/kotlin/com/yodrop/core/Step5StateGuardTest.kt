@@ -24,15 +24,14 @@ class Step5StateGuardTest {
     @Test
     fun fullSenderStateEventMatrix() {
         val states = listOf(
-            SenderState.Idle, SenderState.Grabbed,
-            SenderState.Advertising(offer), SenderState.Claimed,
+            SenderState.Idle,
+            SenderState.Grabbed(offer), SenderState.Claimed,
             SenderState.AwaitAccept("1234"), SenderState.Linking(link),
             SenderState.Auth, SenderState.Transferring(0f, "file.txt"),
             SenderState.Done, SenderState.Cancelled("x"), SenderState.Failed("x")
         )
         val expected = listOf(
             setOf(SessionEvent.GRAB),
-            setOf(SessionEvent.CANCEL),
             setOf(SessionEvent.CLAIM, SessionEvent.CANCEL),
             setOf(SessionEvent.CANCEL),
             setOf(SessionEvent.DECISION, SessionEvent.CANCEL),
@@ -59,7 +58,7 @@ class Step5StateGuardTest {
         val states = listOf(
             ReceiverState.Idle, ReceiverState.Scanning,
             ReceiverState.OfferSeen(offer), ReceiverState.Claimed,
-            ReceiverState.AcceptPrompt(offer, "1234"),
+            ReceiverState.AcceptPrompt(offer, "1234", "file.txt"),
             ReceiverState.Linking(link), ReceiverState.Auth,
             ReceiverState.Receiving(0f, "file.txt"),
             ReceiverState.Verifying("file"),
@@ -95,7 +94,7 @@ class Step5StateGuardTest {
     fun firstClaimWinsAndForeignMessagesAreIgnored() = runTest {
         val sender = SenderStateMachine(backgroundScope)
         sender.onGrabbed(listOf(file), emptyMap())
-        val advertised = (sender.state.value as SenderState.Advertising).offer
+        val advertised = (sender.state.value as SenderState.Grabbed).offer
         val firstKey = CryptoEngine.generateX25519KeyPair()
         val secondKey = CryptoEngine.generateX25519KeyPair()
 
@@ -105,7 +104,7 @@ class Step5StateGuardTest {
         assertFalse(sender.onClaimReceived(
             ClaimMessage(foreignSid, firstKey.publicKey)
         ))
-        assertTrue(sender.state.value is SenderState.Advertising)
+        assertTrue(sender.state.value is SenderState.Grabbed)
 
         val first = async {
             sender.onClaimReceived(
@@ -129,10 +128,9 @@ class Step5StateGuardTest {
 
         val history = sender.transitions.replayCache
         assertEquals(SenderState.Idle, history[0])
-        assertEquals(SenderState.Grabbed, history[1])
-        assertTrue(history[2] is SenderState.Advertising)
-        assertEquals(SenderState.Claimed, history[3])
-        assertTrue(history[4] is SenderState.AwaitAccept)
+        assertTrue(history[1] is SenderState.Grabbed)
+        assertEquals(SenderState.Claimed, history[2])
+        assertTrue(history[3] is SenderState.AwaitAccept)
     }
 
     @Test
@@ -144,15 +142,17 @@ class Step5StateGuardTest {
         assertFailsWith<IllegalStateException> { receiver.acceptTransfer(link) }
 
         sender.onGrabbed(listOf(file), emptyMap())
-        val advertised = (sender.state.value as SenderState.Advertising).offer
+        val advertised = (sender.state.value as SenderState.Grabbed).offer
         receiver.startScanning()
         receiver.onOfferDiscovered(advertised)
 
-        receiver.claimOffer()
+        val claim = receiver.claimOffer()
         assertEquals(ReceiverState.Claimed, receiver.state.value)
         assertFailsWith<IllegalStateException> { receiver.claimOffer() }
         assertFailsWith<IllegalStateException> { receiver.acceptTransfer(link) }
 
+        sender.onClaimReceived(claim)
+        receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
         runCurrent()
         assertTrue(receiver.state.value is ReceiverState.AcceptPrompt)
         assertTrue(receiver.transitions.replayCache.contains(ReceiverState.Claimed))

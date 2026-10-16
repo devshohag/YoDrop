@@ -18,6 +18,8 @@ class BleHandshakeController(
     private val prepareLink: (suspend (HelloMessage, TransportSelection) -> LinkInfoMessage?)? = null,
     private val onLinkReady: (suspend (LinkInfoMessage) -> Unit)? = null,
     private val helloSnapshot: (() -> HelloMessage)? = null,
+    private val onOfferRead: (suspend (String, OfferMessage) -> Unit)? = null,
+    private val connectForClaim: (suspend (String, OfferMessage) -> Unit)? = null,
     private val send: suspend (String, BleControlMessage) -> Unit
 ) {
     private val mutex = Mutex()
@@ -36,24 +38,26 @@ class BleHandshakeController(
                 if (message.deviceId.size != 16 || peer.isBlank()) return@withLock false
                 // Bound unclaimed discovery metadata; this is a single-receiver flow.
                 if (peer !in hellos && hellos.size >= 16) return@withLock false
-                val firstHello = peer !in hellos
                 hellos[peer] = message.copy(deviceId = message.deviceId.copyOf())
-                if (firstHello) send(peer, helloSnapshot?.invoke() ?: localHello)
-                val advertising = sender.state.value as? SenderState.Advertising
-                if (advertising != null) send(peer, advertising.offer)
+                val advertising = sender.state.value as? SenderState.Grabbed
+                if (advertising != null) {
+                    send(peer, helloSnapshot?.invoke() ?: localHello)
+                    send(peer, advertising.offer)
+                }
                 true
             }
             is OfferMessage -> {
-                val hello = hellos[peer] ?: return@withLock false
                 if (sender.state.value !is SenderState.Idle) return@withLock false
                 if (!receiver.onOfferDiscovered(message)) return@withLock false
                 offerPeer = peer
-                _peerName.value = hello.deviceName
+                _peerName.value = message.senderName
+                onOfferRead?.invoke(peer, message)
                 true
             }
             is ClaimMessage -> {
                 val hello = hellos[peer] ?: return@withLock false
                 if (!sender.onClaimReceived(message)) return@withLock false
+                sender.createEncryptedOfferDetails()?.let { send(peer, it) }
                 claimedPeer = peer
                 _peerName.value = hello.deviceName
                 _selection.value = selectTransport?.invoke(hello) ?: sender.selectTransport(
@@ -74,6 +78,9 @@ class BleHandshakeController(
                 }
                 true
             }
+            is EncryptedOfferDetailsMessage -> {
+                peer == offerPeer && receiver.onEncryptedOfferDetailsReceived(message)
+            }
             is EncryptedLinkInfoMessage -> {
                 if (peer != offerPeer) return@withLock false
                 val link = receiver.onEncryptedLinkInfoReceived(message) ?: return@withLock false
@@ -87,7 +94,18 @@ class BleHandshakeController(
     suspend fun claim(): Boolean = mutex.withLock {
         val peer = offerPeer ?: return@withLock false
         if (receiver.state.value !is ReceiverState.OfferSeen) return@withLock false
-        send(peer, receiver.claimOffer())
+        val offer = (receiver.state.value as ReceiverState.OfferSeen).offer
+        val claim = receiver.claimOffer()
+        try {
+            connectForClaim?.invoke(peer, offer)
+            send(peer, claim)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            receiver.cancel("Claim cancelled")
+            throw cancelled
+        } catch (failure: Exception) {
+            receiver.cancel("Could not reconnect to sender")
+            throw failure
+        }
         true
     }
 
@@ -100,8 +118,10 @@ class BleHandshakeController(
 
     suspend fun deny(): Boolean = mutex.withLock {
         val peer = offerPeer ?: return@withLock false
-        if (receiver.state.value !is ReceiverState.AcceptPrompt) return@withLock false
-        send(peer, receiver.denyTransfer("User declined"))
+        val prompt = receiver.state.value as? ReceiverState.AcceptPrompt ?: return@withLock false
+        // Finish the bounded GATT write before terminal-state observers close the BLE link.
+        send(peer, DecisionMessage(prompt.offer.sessionId.copyOf(), false, "User declined"))
+        receiver.denyTransfer("User declined")
         true
     }
 

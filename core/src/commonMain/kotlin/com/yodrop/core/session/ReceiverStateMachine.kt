@@ -5,6 +5,7 @@ import com.yodrop.core.crypto.KeyPair
 import com.yodrop.core.crypto.NonceUtils
 import com.yodrop.core.crypto.SessionKeys
 import com.yodrop.core.crypto.LinkInfoCipher
+import com.yodrop.core.crypto.OfferDetailsCipher
 import com.yodrop.core.platform.FileSink
 import com.yodrop.core.protocol.*
 import com.yodrop.core.transfer.ChunkBitmap
@@ -57,7 +58,6 @@ class ReceiverStateMachine(
     private val activeConnections = mutableSetOf<SessionConnection>()
     private val workers = mutableListOf<Job>()
     private var transfer: ReceiveCoordinator? = null
-    private var promptJob: Job? = null
     private var cleanupJob: Job? = null
     private var linksClosed = CompletableDeferred<Unit>()
     private var cleanupStarted = false
@@ -147,7 +147,7 @@ class ReceiverStateMachine(
             if (offer.sessionId.size != 16 ||
                 offer.senderPubKey.size != 32 ||
                 offer.fileCount !in 1..1000 ||
-                offer.totalBytes < 0) return@withLock false
+                offer.totalBytes < 0 || offer.senderName.encodeToByteArray().size !in 1..256) return@withLock false
 
             activeOffer = copyOffer(offer)
             publishLocked(ReceiverState.OfferSeen(copyOffer(offer)))
@@ -179,22 +179,23 @@ class ReceiverStateMachine(
         sessionKeys = keys
         publishLocked(ReceiverState.Claimed)
 
-        promptJob = scope.launch {
-            yield()
-            eventMutex.withLock {
-                if (_state.value is ReceiverState.Claimed &&
-                    activeOffer === offer) {
-                    publishLocked(ReceiverState.AcceptPrompt(
-                        copyOffer(offer), keys.verifyCode
-                    ))
-                    acceptTimeoutJob = startTimer(
-                        timeouts.acceptPromptMs,
-                        "Receiver accept prompt timed out"
-                    ) { _state.value is ReceiverState.AcceptPrompt }
-                }
-            }
+        acceptTimeoutJob = startTimer(timeouts.acceptPromptMs, "Receiver accept prompt timed out") {
+            _state.value is ReceiverState.Claimed || _state.value is ReceiverState.AcceptPrompt
         }
         ClaimMessage(offer.sessionId.copyOf(), keyPair.publicKey.copyOf())
+    }
+
+    suspend fun onEncryptedOfferDetailsReceived(message: EncryptedOfferDetailsMessage): Boolean = eventMutex.withLock {
+        if (!scope.isActive || _state.value !is ReceiverState.Claimed) return@withLock false
+        val offer = checkNotNull(activeOffer)
+        val details = try {
+            OfferDetailsCipher.open(checkNotNull(sessionKeys), offer.sessionId, message)
+        } catch (_: Exception) {
+            failLocked("OFFER_DETAILS authentication failed")
+            return@withLock false
+        }
+        publishLocked(ReceiverState.AcceptPrompt(copyOffer(offer), checkNotNull(sessionKeys).verifyCode, details.previewName))
+        true
     }
 
     suspend fun acceptTransfer(linkInfo: LinkInfoMessage? = null): DecisionMessage =
@@ -414,18 +415,16 @@ class ReceiverStateMachine(
             if (!SessionPolicy.receiver(_state.value, SessionEvent.RESET)) {
                 return false
             }
-            Triple(workers.toList(), promptJob, cleanupJob)
+            Pair(workers.toList(), cleanupJob)
         }
         pending.first.forEach { it.cancelAndJoin() }
-        pending.second?.cancelAndJoin()
-        pending.third?.join()
+        pending.second?.join()
 
         return eventMutex.withLock {
             if (!SessionPolicy.receiver(_state.value, SessionEvent.RESET)) {
                 return@withLock false
             }
             workers.clear()
-            promptJob = null
             cleanupJob = null
             activeConnections.clear()
             activeOffer = null
@@ -450,7 +449,6 @@ class ReceiverStateMachine(
         acceptTimeoutJob?.cancel()
         linkingTimeoutJob?.cancel()
         reconnectJob?.cancel()
-        promptJob?.cancel()
         lifetimeJob?.cancel()
         val connections = activeConnections.toList()
         activeConnections.clear()

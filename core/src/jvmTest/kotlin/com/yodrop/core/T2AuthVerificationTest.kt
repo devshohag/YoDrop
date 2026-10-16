@@ -21,12 +21,13 @@ class T2AuthVerificationTest {
             "file", "file.txt", 1, "text/plain", ByteArray(32)
         )
         sender.onGrabbed(listOf(meta), emptyMap())
-        val offer = (sender.state.value as SenderState.Advertising).offer
+        val offer = (sender.state.value as SenderState.Grabbed).offer
 
         receiver.startScanning()
         receiver.onOfferDiscovered(offer)
         val claim = receiver.claimOffer()
         sender.onClaimReceived(claim)
+        receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
         receiver.state.first { it is ReceiverState.AcceptPrompt }
         val link = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 1234)
         sender.onDecisionReceived(receiver.acceptTransfer(link), link)

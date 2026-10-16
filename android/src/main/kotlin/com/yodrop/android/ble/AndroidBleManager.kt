@@ -11,12 +11,16 @@ import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.protocol.*
 import com.yodrop.core.protocol.GattDiagnosticProbe as Probe
 import com.yodrop.core.session.BlePeerMessage
+import com.yodrop.core.session.SenderState
 import com.yodrop.core.transport.GattOperationKey
 import com.yodrop.core.transport.GattOperationQueue
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.UUID
@@ -29,7 +33,8 @@ class AndroidBleManager(
     private val localHello: HelloMessage,
     private val requestedMtu: Int = 247,
     private val diagnosticsEnabled: Boolean = false,
-    private val helloSnapshot: (() -> HelloMessage)? = null
+    private val helloSnapshot: (() -> HelloMessage)? = null,
+    private val senderState: () -> SenderState = { SenderState.Idle }
 ) {
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? = bluetoothManager.adapter
@@ -41,6 +46,11 @@ class AndroidBleManager(
     private var operations = GattOperationQueue()
     private var generation = 0L
     private val links = BlePeerLinks()
+    private val offerCache = BleOfferCache()
+    private var readDisconnect: CompletableDeferred<Unit>? = null
+    private var connectionReady: CompletableDeferred<Unit>? = null
+    private var advertisingState: SenderState.Grabbed? = null
+    private var committedPeer: String? = null
     private val target = BleDiscoveryTarget()
     private val devices = mutableMapOf<String, BluetoothDevice>()
     private val serverPeers = mutableSetOf<String>()
@@ -60,20 +70,15 @@ class AndroidBleManager(
     private var probeReply: CompletableDeferred<ByteArray>? = null
     private var expectedProbe: ByteArray? = null
 
-    private val _incomingMessages = MutableSharedFlow<BlePeerMessage>()
-    val incomingMessages = _incomingMessages.asSharedFlow()
     private val _errors = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val errors = _errors.asSharedFlow()
     private data class Decoded(val generation: Long, val event: BlePeerMessage)
     private val decodedMessages = Channel<Decoded>(Channel.BUFFERED)
+    // Filter when the consumer receives, including messages queued before a read-disconnect.
+    val incomingMessages = decodedMessages.receiveAsFlow().filter { it.generation == generation }.map { it.event }
 
     init {
         require(requestedMtu in 23..517)
-        scope.launch(Dispatchers.Main.immediate) {
-            for (message in decodedMessages) {
-                if (message.generation == generation) _incomingMessages.emit(message.event)
-            }
-        }
         scope.launch(Dispatchers.Main.immediate) {
             while (isActive) { delay(1_000); links.expireStale() }
         }
@@ -98,7 +103,9 @@ class AndroidBleManager(
         close()
     }
 
-    fun startAdvertising(offer: OfferMessage) {
+    fun startAdvertising(state: SenderState.Grabbed) {
+        if (senderState() != state) return
+        val offer = state.offer
         if (advertisingSession?.contentEquals(offer.sessionId) == true) return
         stopAdvertising()
         val adv = adapter?.bluetoothLeAdvertiser ?: run {
@@ -108,25 +115,26 @@ class AndroidBleManager(
         advertiser = adv
         val sid = offer.sessionId.copyOf()
         advertisingSession = sid
+        advertisingState = state
         val epoch = generation
         val queue = operations
         advertisingJob = launchWork(epoch) {
             ensureServer(epoch, queue)
-            if (epoch != generation || advertisingSession?.contentEquals(sid) != true) return@launchWork
+            if (epoch != generation || senderState() != state || advertisingSession?.contentEquals(sid) != true) return@launchWork
             val settings = AdvertiseSettings.Builder()
                 .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-                .setConnectable(true).setTimeout(0)
+                .setConnectable(true).setTimeout(BleAdvertisingPacket.TIMEOUT_MS)
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH).build()
-            // UUID/legacy packet redesign is Step 15. Only the session hint is advertised.
-            val data = AdvertiseData.Builder().setIncludeDeviceName(false)
-                .addServiceUuid(ParcelUuid(serviceUuid))
-                .addServiceData(ParcelUuid(serviceUuid), sid).build()
+            check(BleAdvertisingPacket.advertisement().size <= BleAdvertisingPacket.LEGACY_LIMIT)
+            val data = AdvertiseData.Builder().setIncludeDeviceName(false).setIncludeTxPowerLevel(false)
+                .addServiceUuid(ParcelUuid.fromString(BleAdvertisingPacket.serviceUuid)).build()
             adv.startAdvertising(settings, data, advertiseCallback)
         }
     }
 
     fun stopAdvertising() {
         advertisingSession = null
+        advertisingState = null
         advertiser?.stopAdvertising(advertiseCallback)
         // A service-add callback may still finish; its job checks advertisingSession before starting.
         // Established GATT connections remain alive for CLAIM/ACCEPT.
@@ -167,6 +175,10 @@ class AndroidBleManager(
                     val serverSide = peerId in serverPeers
                     val link = if (serverSide) serverKey(peerId) else clientKey(peerId)
                     check(links.subscribed(link)) { "BLE notifications are not enabled" }
+                    if (message is EncryptedOfferDetailsMessage) {
+                        committedPeer = peerId
+                        stopAdvertising()
+                    }
                     val bytes = BleMessageCodec.encode(message)
                     val packets = links.fragments(link, txCounter, bytes)
                     txCounter = (txCounter + 1) and 0xffff
@@ -206,12 +218,59 @@ class AndroidBleManager(
                 if (epoch == generation) close()
                 throw cancelled
             } catch (failure: Exception) {
+                // A discovery reader may leave immediately after receiving the last notification.
+                if (epoch != generation && (message is OfferMessage || message is HelloMessage)) return@withContext
                 failLink(epoch)
                 throw failure
             }
         }
 
-    fun close() {
+    /** Cache the public OFFER, then release the discovery connection until the user taps Claim. */
+    suspend fun offerRead(peer: String, offer: OfferMessage) = withContext(Dispatchers.Main.immediate) {
+        val client = checkNotNull(activeGattClient)
+        check(client.device.address == peer && target.matches(peer, offer.sessionId))
+        offerCache.put(peer, offer)
+        stopScanning()
+        val disconnected = CompletableDeferred<Unit>()
+        readDisconnect = disconnected
+        try {
+            client.disconnect()
+            check(withTimeoutOrNull(5_000) { disconnected.await(); true } == true) { "Discovery disconnect timed out" }
+        } finally {
+            readDisconnect = null
+            close(clearOfferCache = false)
+        }
+    }
+
+    suspend fun connectForClaim(peer: String, offer: OfferMessage) = withContext(Dispatchers.Main.immediate) {
+        check(activeGattClient == null && serverPeers.isEmpty()) { "Another GATT connection is active" }
+        val cached = checkNotNull(offerCache.get(peer, offer.sessionId)) { "Offer cache expired; scan again" }
+        check(cached.senderPubKey.contentEquals(offer.senderPubKey)) { "Offer changed" }
+        check(target.select(peer) && target.bindSession(peer, offer.sessionId))
+        val ready = CompletableDeferred<Unit>()
+        connectionReady = ready
+        val epoch = generation
+        try {
+            val device = checkNotNull(adapter).getRemoteDevice(peer)
+            activeGattClient = checkNotNull(device.connectGatt(context, false,
+                clientCallback(epoch, operations), BluetoothDevice.TRANSPORT_LE))
+            withTimeout(30_000) { ready.await() }
+        } catch (cancelled: CancellationException) {
+            close(clearOfferCache = false)
+            throw cancelled
+        } catch (failure: Exception) {
+            failLink(epoch)
+            throw failure
+        }
+    }
+
+    fun close(clearOfferCache: Boolean = true) {
+        if (clearOfferCache) offerCache.clear()
+        committedPeer = null
+        readDisconnect?.cancel()
+        readDisconnect = null
+        connectionReady?.cancel()
+        connectionReady = null
         generation++ // Old callback objects cannot acknowledge operations on the replacement queue.
         operations.close()
         operations = GattOperationQueue()
@@ -266,12 +325,12 @@ class AndroidBleManager(
         }
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val found = result ?: return
-            val hint = found.scanRecord?.getServiceData(ParcelUuid(serviceUuid))?.copyOf() ?: return
+            if (found.scanRecord?.serviceUuids?.contains(ParcelUuid(serviceUuid)) != true || !found.isConnectable) return
             val epoch = scanEpoch
             launchWork(epoch) {
-                if (serial != scanSerial || !scanning || hint.size != 16 || activeGattClient != null) return@launchWork
+                if (serial != scanSerial || !scanning || activeGattClient != null || serverPeers.isNotEmpty()) return@launchWork
                 val peer = found.device.address
-                if (!target.select(peer, hint)) return@launchWork
+                if (offerCache.alreadyRead(peer) || !target.select(peer)) return@launchWork
                 val queue = operations
                 activeGattClient = checkNotNull(found.device.connectGatt(context, false,
                     clientCallback(epoch, queue), BluetoothDevice.TRANSPORT_LE))
@@ -292,15 +351,21 @@ class AndroidBleManager(
                 val link = serverKey(id)
                 if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
                     if (links.contains(link)) return@launchWork
-                    if (advertisingSession == null || !links.connect(link)) {
+                    if (advertisingSession == null || serverPeers.isNotEmpty() || activeGattClient != null || !links.connect(link)) {
                         gattServer?.cancelConnection(peer)
                     } else {
                         devices[id] = peer
                         serverPeers.add(id)
                     }
                 } else if (links.contains(link)) {
-                    // Single-send control flow retries explicitly after a disconnect, never on a different peer.
-                    failLink(epoch)
+                    if (committedPeer == id) failLink(epoch)
+                    else {
+                        // A discovery reader leaves without CLAIM. Retire its queue/callback generation
+                        // and resume the same bounded offer, without failing the sender session.
+                        val grabbed = advertisingState
+                        close(clearOfferCache = false)
+                        if (grabbed != null) startAdvertising(grabbed)
+                    }
                 }
             }
         }
@@ -402,10 +467,12 @@ class AndroidBleManager(
                     links.subscribe(link, true)
                     if (diagnosticsEnabled) Log.d("YoDropBLE", "client ATT MTU=${links.mtu(link)}; CCCD enabled")
                     sendControlMessage(client.device.address, helloSnapshot?.invoke() ?: localHello)
-                    if (diagnosticsEnabled) probeJob = launchWork(epoch) { runProbe(client.device.address, link) }
+                    connectionReady?.complete(Unit)
+                    if (diagnosticsEnabled && connectionReady != null) probeJob = launchWork(epoch) { runProbe(client.device.address, link) }
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED || status != BluetoothGatt.GATT_SUCCESS) {
-                failLink(epoch)
+                val reading = readDisconnect
+                if (reading != null) reading.complete(Unit) else failLink(epoch)
             }
         }
         override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) = handle(gatt) { _, link ->
@@ -439,7 +506,10 @@ class AndroidBleManager(
 
     private fun dispatch(peer: String, bytes: ByteArray, epoch: Long) {
         val message = runCatching { BleMessageCodec.decode(bytes) }.getOrNull() ?: return
-        if (message is OfferMessage && peer !in serverPeers && !target.matches(peer, message.sessionId)) return
+        if (message is OfferMessage && peer !in serverPeers && !target.bindSession(peer, message.sessionId)) {
+            failLink(epoch)
+            return
+        }
         if (message is LinkInfoMessage && Probe.isProbe(message)) {
             if (diagnosticsEnabled && bytes.size == Probe.SIZE) {
                 if (message.extra[Probe.MODE] == "Q") {

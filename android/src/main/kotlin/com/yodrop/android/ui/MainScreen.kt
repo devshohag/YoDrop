@@ -59,7 +59,6 @@ fun MainScreen(
             }
             receiverState is ReceiverState.OfferSeen -> {
                 Text("From: ${peerName ?: "Nearby device"}")
-                Text(receiverState.offer.previewName, modifier = Modifier.padding(top = 8.dp))
                 Text("${receiverState.offer.fileCount} file(s), ${receiverState.offer.totalBytes} bytes")
                 Button(onClick = onClaimClick, modifier = Modifier.padding(top = 16.dp)) {
                     Text("Receive this file")
@@ -67,7 +66,13 @@ fun MainScreen(
                 OutlinedButton(onClick = onCancelClick) { Text("Cancel") }
             }
 
-            senderState is SenderState.Advertising -> {
+            receiverState is ReceiverState.Claimed -> {
+                CircularProgressIndicator()
+                Text("Reading encrypted file details...")
+                Button(onClick = onCancelClick) { Text("Cancel") }
+            }
+
+            senderState is SenderState.Grabbed -> {
                 CircularProgressIndicator()
                 Text("Advertising... Waiting for receiver", modifier = Modifier.padding(top = 16.dp))
                 Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
@@ -90,7 +95,7 @@ fun MainScreen(
 
             receiverState is ReceiverState.AcceptPrompt -> {
                 Text("From: ${peerName ?: "Nearby device"}")
-                Text("Incoming file: ${receiverState.offer.previewName}")
+                Text("Incoming file: ${receiverState.previewName}")
                 Text(
                     text = receiverState.verifyCode,
                     style = MaterialTheme.typography.displayMedium,

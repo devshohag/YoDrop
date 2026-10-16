@@ -484,3 +484,51 @@
   directional/key separation, consent, retries/reset/parallel counters, replay,
   redaction and authenticated endpoint-driven real TCP. Physical Android LAN,
   hotspot and earlier matching-code/GATT acceptances remain unclaimed.
+
+
+## [Step 15 / A4] UUID-only discovery and private post-CLAIM filename
+
+Owner approval: 2026-10-16. Discover by service UUID only, then read the complete
+OFFER over GATT, subject to the four owner conditions. ARCHITECTURE §5.1 and §8
+now describe this approved behavior.
+
+- Service UUID `965ff8a1-0a45-47ab-aca5-46d565d63e84` was generated once as UUIDv4.
+  Write/notify characteristics also use fixed random 128-bit UUIDs instead of
+  Bluetooth SIG assigned-number UUIDs. CCCD remains standard 0x2902.
+- Legacy advertising carries only that service UUID: 18-byte UUID AD plus 3-byte
+  connectable Flags, total 21/31 bytes. Scan response is empty. No session hint,
+  file name, local name, service data, manufacturer data or extended-advertising
+  requirement. This supersedes the original Step 15 sessionId scan-response plan.
+- `SenderState.Grabbed(offer)` owns advertising; the old Advertising state is removed.
+  Android checks the current sender state before starting and after service setup,
+  uses a 60,000 ms platform advertising timeout and stops when leaving Grabbed.
+  Terminal observers close BLE; the existing sender OFFER deadline is 60 seconds.
+- Plain tag-02 OFFER contains exactly sessionId, senderPubKey, senderName,
+  fileCount and totalBytes. Strict OFFER decoding rejects old/extra plaintext fields.
+  Actual sender model name is supplied independently of the selected filename.
+- Tag 07 is encrypted OFFER_DETAILS carrying previewName after a valid CLAIM/ECDH.
+  AES-256-GCM uses HKDF-Expand info `YoDrop-BLE-S2R-OFFER_DETAILS-v1`, its own
+  `OFRDTLS1` + u32 counter nonce and AAD=sessionId. Counters never rewind on reset.
+  This key/nonce domain is distinct from LINK_INFO and TCP chunk encryption.
+  Receiver accepts only from its chosen peer while Claimed; bad authentication
+  fails without displaying a prompt. AcceptPrompt reads the decrypted previewName.
+  A missing details message also expires under the post-CLAIM 60-second timer.
+- Android obtains OFFER through the existing fragmented HELLO/write -> OFFER/notify
+  exchange. Public offers are cached by peer/session (16 entries, 60-second TTL,
+  copied byte arrays). Discovery disconnect waits for the disconnect callback,
+  then retires the queue/generation; an explicit Claim reconnects the cached peer
+  and binds its session. A UUID-only scan cannot know that a cached peer has a new
+  session until TTL expiry or explicit reset, which clears the cache.
+- Client and server reject concurrent extra GATT connections. A discovery reader
+  leaving before CLAIM does not fail the sender: it rebuilds the GATT server and
+  resumes the same Grabbed offer within its original state-machine deadline.
+  Accepted CLAIM keeps the connection; queued decoded messages are checked against
+  their generation at consumption, so retired discovery events are discarded.
+- Android requests MTU 247 after connect; negotiated callback MTU drives fragments,
+  with 23 fallback. Existing debug override/probe remains; probe now runs on the
+  Claim reconnect so the discovery read/disconnect cannot interrupt it.
+- DENY finishes its bounded GATT write before publishing local terminal state,
+  allowing terminal observers to close BLE without cancelling that final write.
+
+Validation details are in STEP15-VALIDATION.md. Physical scanner/two-phone results
+remain PENDING; this is compatibility preparation, not an implemented iOS sender.

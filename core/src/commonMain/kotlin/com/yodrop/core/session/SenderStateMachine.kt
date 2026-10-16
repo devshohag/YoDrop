@@ -5,6 +5,7 @@ import com.yodrop.core.crypto.KeyPair
 import com.yodrop.core.crypto.NonceUtils
 import com.yodrop.core.crypto.SessionKeys
 import com.yodrop.core.crypto.LinkInfoCipher
+import com.yodrop.core.crypto.OfferDetailsCipher
 import com.yodrop.core.platform.FileSource
 import com.yodrop.core.protocol.*
 import com.yodrop.core.transfer.ChunkPlanner
@@ -51,6 +52,7 @@ class SenderStateMachine(
     private val authenticated = mutableSetOf<SessionConnection>()
     private val attemptMutex = Mutex()
     private var attemptCounter = 0
+    private var detailsCounter = 0L
     private var linkInfoCounter = 0L // Lifetime monotonic, including resets/failed BLE sends.
     private val workers = mutableListOf<Job>()
     private var cleanupJob: Job? = null
@@ -103,7 +105,8 @@ class SenderStateMachine(
 
     suspend fun onGrabbed(
         files: List<FileMeta>,
-        sources: Map<String, FileSource>
+        sources: Map<String, FileSource>,
+        senderName: String = "YoDrop"
     ): Boolean = eventMutex.withLock {
         if (!scope.isActive ||
             !SessionPolicy.sender(_state.value, SessionEvent.GRAB)) {
@@ -111,8 +114,8 @@ class SenderStateMachine(
         }
 
         ManifestMessage(files).validate()
+        require(senderName.encodeToByteArray().size in 1..256)
         watchLifetime()
-        publishLocked(SenderState.Grabbed)
         filesToSend = files.map { it.copy(sha256 = it.sha256.copyOf()) }
         fileSourceMap = sources.toMap()
 
@@ -126,14 +129,14 @@ class SenderStateMachine(
             keyPair.publicKey.copyOf(),
             files.size,
             files.sumOf { it.size },
-            files.first().name
+            senderName
         )
-        publishLocked(SenderState.Advertising(offer))
+        publishLocked(SenderState.Grabbed(offer))
 
         offerTimeoutJob = scope.launch {
             delay(timeouts.offerMs)
             eventMutex.withLock {
-                if (_state.value is SenderState.Advertising) {
+                if (_state.value is SenderState.Grabbed) {
                     failLocked("Offer expired")
                 }
             }
@@ -231,6 +234,16 @@ class SenderStateMachine(
             }
         }
         true
+    }
+
+    suspend fun createEncryptedOfferDetails(): EncryptedOfferDetailsMessage? = eventMutex.withLock {
+        if (!scope.isActive || _state.value !is SenderState.AwaitAccept) return@withLock null
+        if (detailsCounter > OfferDetailsCipher.MAX_COUNTER) {
+            failLocked("OFFER_DETAILS nonce counter exhausted")
+            return@withLock null
+        }
+        OfferDetailsCipher.seal(checkNotNull(sessionKeys), checkNotNull(sessionId), detailsCounter++,
+            OfferDetails(filesToSend.first().name))
     }
 
     suspend fun createEncryptedLinkInfo(linkInfo: LinkInfoMessage): EncryptedLinkInfoMessage? = eventMutex.withLock {

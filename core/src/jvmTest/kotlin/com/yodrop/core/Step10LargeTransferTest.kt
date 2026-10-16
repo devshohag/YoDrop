@@ -147,8 +147,9 @@ class Step10LargeTransferTest {
                     override suspend fun close() { sourceCloses.incrementAndGet(); diskSource.close() }
                 }))
                 receiver.startScanning()
-                receiver.onOfferDiscovered(assertIs<SenderState.Advertising>(sender.state.value).offer)
+                receiver.onOfferDiscovered(assertIs<SenderState.Grabbed>(sender.state.value).offer)
                 sender.onClaimReceived(receiver.claimOffer())
+                receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
                 receiver.state.first { it is ReceiverState.AcceptPrompt }
                 val link = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 1234)
                 sender.onDecisionReceived(receiver.acceptTransfer(link), link)

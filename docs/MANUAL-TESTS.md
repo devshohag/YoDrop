@@ -19,15 +19,16 @@ and grant the requested Bluetooth permissions (location for scanning on API 29/3
 
 1. Sender: tap Send File and choose a file of at least 64 KiB with a recognizable
    name. Confirm the sender advertises. Receiver: tap Receive.
-2. Receiver must show the sender's HELLO name and the full OFFER filename, file
-   count and byte count received over GATT, not a decoded/truncated advertisement.
+2. Receiver must show the public OFFER sender name, file count and byte count
+   received over GATT. As of A4, no filename is shown before CLAIM.
 3. Within the ten-second claim window, tap Receive this file. Confirm both phones
-   show the **same four decimal digits**. Record each displayed code below. Merely
+   show the **same four decimal digits** and the receiver shows the filename from
+   authenticated OFFER_DETAILS. Record each displayed code below. Merely
    seeing the receiver prompt is insufficient; sender must also show its code.
 4. Compare the codes before tapping Accept. Both phones should reach the linking
-   screen. This step does not create a bulk data connection; endpoint/encrypted
-   LINK_INFO and actual data-link setup are later work. Do not label this a file
-   transfer success; the existing linking deadline still applies.
+   screen. Pairing/code agreement alone is not proof of a file transfer. Step 14+
+   wires actual LAN setup after encrypted LINK_INFO; use its separate file/hash
+   checklist below. Other transport types remain pending Steps 16/17.
 5. Reset both apps and repeat, choosing Deny at the receiver prompt. Receiver
    should show cancellation; sender should show receiver-denied failure.
 6. Repeat Cancel/Back to Home and discover again. Record any missing OFFER,
@@ -35,7 +36,7 @@ and grant the requested Bluetooth permissions (location for scanning on API 29/3
 
 | Observation | Result |
 | --- | --- |
-| Full GATT OFFER metadata matched selected file | PENDING |
+| Public GATT OFFER totals and post-CLAIM decrypted filename matched selected file | PENDING |
 | Sender displayed code | Not recorded |
 | Receiver displayed code | Not recorded |
 | Both four-digit codes matched | PENDING |
@@ -73,8 +74,8 @@ foreach ($phone in @($senderPhone, $receiverPhone)) {
 ```
 
 1. Grant permissions and enable Bluetooth on both phones. Sender chooses a file
-   (at least 64 KiB); receiver taps Receive. The client sends the probe automatically
-   after subscription/HELLO. Do not count the normal CLAIM or small HELLO as a 1 KiB
+   (at least 64 KiB); receiver taps Receive, then Receive this file to CLAIM. The client sends the probe
+   automatically after subscription/HELLO on this Claim reconnect. Do not count the normal CLAIM or small HELLO as a 1 KiB
    probe. Keep both apps foreground.
 2. Capture receiver logs and require **GATT_PROBE PASS requestBytes=1024
    replyBytes=1024 actualMtu=23**, plus CCCD confirmation:
@@ -85,7 +86,7 @@ adb -s $senderPhone logcat -d -s 'YoDropBLE:D' '*:S'
 ```
 
 3. Force-stop both apps, clear logs and repeat the launch script with
-   `--ei yodrop_ble_mtu 247`. Repeat file selection/Receive. Require a new PASS line
+   `--ei yodrop_ble_mtu 247`. Repeat file selection/Receive/Receive this file. Require a new PASS line
    and record actual MTU. Android 14+ can choose **517** for the first MTU request;
    a request for 247 does not prove MTU 247. Record 517 separately and leave exact
    247 pending unless a device pair actually negotiates 247.
@@ -155,3 +156,46 @@ credentials should be printed in logcat, error messages or state dumps.
 - Step 3: X25519 instrumentation on a real API 29 device.
 - Step 13: 1 KiB GATT round trip at default MTU and negotiated MTU 247.
 - Later transport steps: real Wi-Fi Direct/hotspot lifecycle, throughput and resume.
+
+
+## Step 15 / A4: UUID-only discovery and read/disconnect/reconnect
+
+Status: **PENDING — no scanner capture or physical-device result recorded.**
+Install the same Step 15+ APK on both phones; old APK UUIDs/schema are incompatible.
+Keep apps foreground. Use a BLE scanner app on a separate phone where available.
+
+1. With sender Idle, scanner must not see the YoDrop service. Select a file to
+   enter Grabbed; filter scanner by service UUID
+   `965ff8a1-0a45-47ab-aca5-46d565d63e84`. Inspect raw AD: Flags plus one complete
+   128-bit service UUID, 21 bytes total; no filename, sessionId, local name or
+   service/manufacturer data. Empty scan response. Record the raw capture.
+2. Leave an offer unclaimed. It must stop by the original 60-second deadline.
+   Repeat Cancel and Done/Deny paths: no remaining advertisement/connection.
+3. Receiver taps Receive: it connects, requests MTU 247 (record actual MTU), reads
+   the full public OFFER via GATT notifications, caches it, and disconnects before
+   waiting for Claim. UI shows sender name/count/bytes, without filename or Accept.
+   Confirm disconnection using scanner/Android Bluetooth diagnostics.
+4. Tap Receive this file within the receiver's claim window. Confirm reconnect to
+   the same sender, matching verification codes, and filename appearing only in
+   the accept prompt after encrypted tag 07. Deny and confirm sender receives it.
+   Repeat Accept on the same LAN and the Step 14 file/hash checks.
+5. With a third phone, attempt another connection while a read or claim connection
+   is active. It must be rejected; no mixed offers/keys. An unclaimed read followed
+   by disconnection must allow another reader, without failing the sender.
+6. Repeated scan callbacks must not create parallel reads. Reset clears cached
+   offers; TTL is 60 seconds. A peer's new session is not identifiable from its
+   service-only advertisement until reread (TTL/reset).
+7. Repeat the 1 KiB diagnostic at MTU 23 and requested 247 using the updated steps
+   above. Android 14+ may report 517; record actual 247 only if negotiated.
+
+| Check | Models / OS / date / observed result |
+| --- | --- |
+| Raw UUID-only advertisement <=31 bytes, empty scan response | PENDING |
+| Idle absent; Grabbed present; original 60s expiry and terminal stop | PENDING |
+| Read/cache/disconnect, explicit Claim reconnect to same peer | PENDING |
+| No filename before CLAIM; decrypted filename and matching codes after | PENDING |
+| One active GATT connection; discovery disconnect permits next reader | PENDING |
+| Actual MTU and fragmented probe | PENDING |
+| Updated same-LAN transfer and SHA-256 | PENDING |
+
+No iOS physical discovery or background advertising result is claimed.

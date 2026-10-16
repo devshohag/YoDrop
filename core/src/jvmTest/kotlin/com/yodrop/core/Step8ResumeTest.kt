@@ -64,8 +64,9 @@ class Step8ResumeTest {
 
     private suspend fun handshake(sender: SenderStateMachine, receiver: ReceiverStateMachine) {
         receiver.startScanning()
-        receiver.onOfferDiscovered(assertIs<SenderState.Advertising>(sender.state.value).offer)
+        receiver.onOfferDiscovered(assertIs<SenderState.Grabbed>(sender.state.value).offer)
         sender.onClaimReceived(receiver.claimOffer())
+        receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
         receiver.state.first { it is ReceiverState.AcceptPrompt }
         val link = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 1234)
         sender.onDecisionReceived(receiver.acceptTransfer(link), link)
@@ -111,7 +112,7 @@ class Step8ResumeTest {
                     onCleanup = { receiverClosed.complete(Unit) },
                     sinkFactory = { DiskFileSink(it.id, destination) })
                 sender.onGrabbed(listOf(file), mapOf(file.id to DiskFileSource(file.id, sourceFile)))
-                val sid = assertIs<SenderState.Advertising>(sender.state.value).offer.sessionId.copyOf()
+                val sid = assertIs<SenderState.Grabbed>(sender.state.value).offer.sessionId.copyOf()
                 handshake(sender, receiver)
                 val (a, b) = pair()
                 sender.attachConnection(a)
@@ -196,7 +197,7 @@ class Step8ResumeTest {
                 val expected = makeFile(source, 8)
                 val file = FileMeta("crash", "source.dat", source.length(), "application/octet-stream", expected)
                 sender.onGrabbed(listOf(file), mapOf(file.id to DiskFileSource(file.id, source)))
-                val sid = assertIs<SenderState.Advertising>(sender.state.value).offer.sessionId
+                val sid = assertIs<SenderState.Grabbed>(sender.state.value).offer.sessionId
                 val persisted = ChunkBitmap(2).apply { markReceived(0) }
                 store.saveBitmap(sid, file.id, persisted)
                 if (!missingPart) RandomAccessFile(dir.resolve("received.dat.part"), "rw").use {
@@ -329,7 +330,7 @@ class Step8ResumeTest {
                 makeFile(source, 1)
                 val file = FileMeta("bad", "source.dat", source.length(), "application/octet-stream", ByteArray(32))
                 sender.onGrabbed(listOf(file), mapOf(file.id to DiskFileSource(file.id, source)))
-                val sid = assertIs<SenderState.Advertising>(sender.state.value).offer.sessionId
+                val sid = assertIs<SenderState.Grabbed>(sender.state.value).offer.sessionId
                 handshake(sender, receiver)
                 val (a, b) = pair()
                 sender.attachConnection(a)

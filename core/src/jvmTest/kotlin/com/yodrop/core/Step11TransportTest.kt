@@ -150,7 +150,7 @@ class Step11TransportTest {
                 val file = FileMeta("f", "payload.bin", size, "application/octet-stream",
                     CryptoEngine.sha256(data))
                 assertTrue(sender.onGrabbed(listOf(file), mapOf("f" to MemoryFileSource("f", data))))
-                val offer = (sender.state.value as SenderState.Advertising).offer
+                val offer = (sender.state.value as SenderState.Grabbed).offer
                 val receiverKey = CryptoEngine.generateX25519KeyPair()
                 assertTrue(sender.onClaimReceived(ClaimMessage(offer.sessionId, receiverKey.publicKey)))
                 val before = sender.state.value

@@ -5,9 +5,8 @@ import com.yodrop.core.protocol.OfferMessage
 
 sealed interface SenderState {
     data object Idle : SenderState
-    data object Grabbed : SenderState
     data object Claimed : SenderState
-    data class Advertising(val offer: OfferMessage) : SenderState
+    data class Grabbed(val offer: OfferMessage) : SenderState
     data class AwaitAccept(val verifyCode: String) : SenderState
     data class Linking(val linkInfo: LinkInfoMessage? = null) : SenderState
     data object Auth : SenderState
@@ -22,7 +21,7 @@ sealed interface ReceiverState {
     data object Scanning : ReceiverState
     data class OfferSeen(val offer: OfferMessage) : ReceiverState
     data object Claimed : ReceiverState
-    data class AcceptPrompt(val offer: OfferMessage, val verifyCode: String) : ReceiverState
+    data class AcceptPrompt(val offer: OfferMessage, val verifyCode: String, val previewName: String) : ReceiverState
     data class Linking(val linkInfo: LinkInfoMessage? = null) : ReceiverState
     data object Auth : ReceiverState
     data class Receiving(val progress: Float, val currentFileName: String) : ReceiverState

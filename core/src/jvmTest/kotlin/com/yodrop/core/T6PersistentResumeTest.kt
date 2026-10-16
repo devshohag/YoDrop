@@ -69,7 +69,7 @@ class T6PersistentResumeTest {
             // Step 1: Pre-seed resume store with chunk 0 already completed (simulating prior partial transfer)
             val sender = SenderStateMachine(this)
             sender.onGrabbed(listOf(meta), mapOf(meta.id to source))
-            val realOffer = (sender.state.value as SenderState.Advertising).offer
+            val realOffer = (sender.state.value as SenderState.Grabbed).offer
             val fixedSid = realOffer.sessionId
             val totalChunks = 2
             val preBitmap = resumeStore.loadBitmap(fixedSid, meta.id, totalChunks)
@@ -92,6 +92,7 @@ class T6PersistentResumeTest {
             receiver.onOfferDiscovered(realOffer)
             val claim = receiver.claimOffer()
             sender.onClaimReceived(claim)
+            receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
 
             val linkInfo = LinkInfoMessage(LinkType.LAN, "127.0.0.1", port)
             receiver.state.first { it is ReceiverState.AcceptPrompt }

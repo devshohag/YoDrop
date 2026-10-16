@@ -39,6 +39,7 @@ class T8TimeoutsAndCleanupTest {
 
         suspend fun claim() {
             sender.onClaimReceived(receiver.claimOffer())
+            receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
             receiver.state.first { it is ReceiverState.AcceptPrompt }
         }
 
@@ -75,7 +76,7 @@ class T8TimeoutsAndCleanupTest {
         )
         receiver.startScanning()
         receiver.onOfferDiscovered(
-            (sender.state.value as SenderState.Advertising).offer
+            (sender.state.value as SenderState.Grabbed).offer
         )
         return Fixture(sender, receiver, counts)
     }
@@ -103,7 +104,7 @@ class T8TimeoutsAndCleanupTest {
         runCurrent()
         advanceTimeBy(99)
         runCurrent()
-        assertTrue(f.sender.state.value is SenderState.Advertising)
+        assertTrue(f.sender.state.value is SenderState.Grabbed)
         advanceTimeBy(1)
         runCurrent()
         assertTrue(f.sender.state.value is SenderState.Failed)
@@ -316,7 +317,7 @@ class T8TimeoutsAndCleanupTest {
         advanceTimeBy(100)
         runCurrent()
         assertTrue(first.sender.state.value is SenderState.Failed)
-        assertTrue(second.sender.state.value is SenderState.Advertising)
+        assertTrue(second.sender.state.value is SenderState.Grabbed)
 
         advanceTimeBy(100)
         runCurrent()

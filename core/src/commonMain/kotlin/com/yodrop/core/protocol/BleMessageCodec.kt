@@ -3,6 +3,7 @@ package com.yodrop.core.protocol
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.cbor.Cbor
 import com.yodrop.core.crypto.LinkInfoCipher
+import com.yodrop.core.crypto.OfferDetailsCipher
 import com.yodrop.core.transport.TransportSelector
 
 object BleMessageType {
@@ -12,6 +13,7 @@ object BleMessageType {
     const val ACCEPT = 0x04
     const val DENY = 0x05
     const val LINK_INFO = 0x06
+    const val OFFER_DETAILS = 0x07
     const val GATT_PROBE = 0x7f
 }
 
@@ -19,16 +21,19 @@ object BleMessageType {
 @OptIn(ExperimentalSerializationApi::class)
 object BleMessageCodec {
     const val MAX_MESSAGE_BYTES = 16 * 1024
+    private val offerCbor = Cbor { ignoreUnknownKeys = false }
     private val cbor = Cbor { ignoreUnknownKeys = true }
 
     fun encode(message: BleControlMessage): ByteArray {
         validate(message)
         val (type, payload) = when (message) {
             is HelloMessage -> BleMessageType.HELLO to cbor.encodeToByteArray(HelloMessage.serializer(), message)
-            is OfferMessage -> BleMessageType.OFFER to cbor.encodeToByteArray(OfferMessage.serializer(), message)
+            is OfferMessage -> BleMessageType.OFFER to offerCbor.encodeToByteArray(OfferMessage.serializer(), message)
             is ClaimMessage -> BleMessageType.CLAIM to cbor.encodeToByteArray(ClaimMessage.serializer(), message)
             is DecisionMessage -> (if (message.accepted) BleMessageType.ACCEPT else BleMessageType.DENY) to
                 cbor.encodeToByteArray(DecisionMessage.serializer(), message)
+            is EncryptedOfferDetailsMessage -> BleMessageType.OFFER_DETAILS to
+                cbor.encodeToByteArray(EncryptedOfferDetailsMessage.serializer(), message)
             is EncryptedLinkInfoMessage -> BleMessageType.LINK_INFO to
                 cbor.encodeToByteArray(EncryptedLinkInfoMessage.serializer(), message)
             is LinkInfoMessage -> BleMessageType.GATT_PROBE to cbor.encodeToByteArray(LinkInfoMessage.serializer(), message)
@@ -43,12 +48,13 @@ object BleMessageCodec {
         val payload = bytes.copyOfRange(1, bytes.size)
         val message = when (type) {
             BleMessageType.HELLO -> cbor.decodeFromByteArray(HelloMessage.serializer(), payload)
-            BleMessageType.OFFER -> cbor.decodeFromByteArray(OfferMessage.serializer(), payload)
+            BleMessageType.OFFER -> offerCbor.decodeFromByteArray(OfferMessage.serializer(), payload)
             BleMessageType.CLAIM -> cbor.decodeFromByteArray(ClaimMessage.serializer(), payload)
             BleMessageType.ACCEPT, BleMessageType.DENY ->
                 cbor.decodeFromByteArray(DecisionMessage.serializer(), payload).also {
                     require(it.accepted == (type == BleMessageType.ACCEPT)) { "BLE decision/type mismatch" }
                 }
+            BleMessageType.OFFER_DETAILS -> cbor.decodeFromByteArray(EncryptedOfferDetailsMessage.serializer(), payload)
             BleMessageType.LINK_INFO -> cbor.decodeFromByteArray(EncryptedLinkInfoMessage.serializer(), payload)
             BleMessageType.GATT_PROBE -> cbor.decodeFromByteArray(LinkInfoMessage.serializer(), payload)
             else -> throw IllegalArgumentException("Unknown BLE message type $type")
@@ -69,7 +75,7 @@ object BleMessageCodec {
             is OfferMessage -> {
                 require(message.sessionId.size == 16 && message.senderPubKey.size == 32) { "Invalid OFFER keys" }
                 require(message.fileCount in 1..1000 && message.totalBytes >= 0) { "Invalid OFFER size" }
-                require(message.previewName.encodeToByteArray().size in 1..1024) { "Invalid preview name" }
+                require(message.senderName.encodeToByteArray().size in 1..256) { "Invalid sender name" }
             }
             is ClaimMessage -> require(message.sessionId.size == 16 && message.receiverPubKey.size == 32) {
                 "Invalid CLAIM keys"
@@ -78,6 +84,8 @@ object BleMessageCodec {
                 require(message.sessionId.size == 16) { "Invalid decision session" }
                 require(message.reason.encodeToByteArray().size <= 512) { "Decision reason too long" }
             }
+            is EncryptedOfferDetailsMessage -> require(message.counter in 0..OfferDetailsCipher.MAX_COUNTER &&
+                message.ciphertext.size in 17..OfferDetailsCipher.MAX_CIPHERTEXT_BYTES) { "Invalid encrypted OFFER_DETAILS" }
             is EncryptedLinkInfoMessage -> require(message.counter in 0..LinkInfoCipher.MAX_COUNTER &&
                 message.ciphertext.size in 17..LinkInfoCipher.MAX_CIPHERTEXT_BYTES) { "Invalid encrypted LINK_INFO" }
             is LinkInfoMessage -> {

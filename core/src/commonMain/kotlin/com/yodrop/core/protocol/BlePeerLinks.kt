@@ -45,18 +45,20 @@ class BlePeerLinks(
     fun expireStale() { links.values.forEach { it.assembler.expireStale() } }
 }
 
-/** First qualifying advertisement pins discovery until explicit reset/retry. */
+/** UUID-only discovery pins a peer; only a full GATT OFFER binds its session. */
 class BleDiscoveryTarget {
     var peerId: String? = null
         private set
     private var sessionId: ByteArray? = null
 
-    fun select(peer: String, session: ByteArray): Boolean {
-        if (peer.isBlank() || session.size != 16) return false
-        if (peerId == null) {
-            peerId = peer
-            sessionId = session.copyOf()
-        }
+    fun select(peer: String): Boolean {
+        if (peer.isBlank()) return false
+        if (peerId == null) peerId = peer
+        return peerId == peer
+    }
+    fun bindSession(peer: String, session: ByteArray): Boolean {
+        if (peerId != peer || session.size != 16) return false
+        if (sessionId == null) sessionId = session.copyOf()
         return matches(peer, session)
     }
     fun matches(peer: String, session: ByteArray) =

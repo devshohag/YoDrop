@@ -19,7 +19,7 @@ internal object SessionPolicy {
     fun sender(state: SenderState, event: SessionEvent): Boolean =
         when (event) {
             SessionEvent.GRAB -> state is SenderState.Idle
-            SessionEvent.CLAIM -> state is SenderState.Advertising
+            SessionEvent.CLAIM -> state is SenderState.Grabbed
             SessionEvent.DECISION -> state is SenderState.AwaitAccept
             SessionEvent.ATTACH ->
                 state is SenderState.Linking ||

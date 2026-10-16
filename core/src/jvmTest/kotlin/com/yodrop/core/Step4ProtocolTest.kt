@@ -130,10 +130,11 @@ class Step4ProtocolTest {
             listOf(file),
             mapOf(file.id to MemoryFileSource(file.id, bytes))
         )
-        val offer = (sender.state.value as SenderState.Advertising).offer
+        val offer = (sender.state.value as SenderState.Grabbed).offer
         receiver.startScanning()
         receiver.onOfferDiscovered(offer)
         sender.onClaimReceived(receiver.claimOffer())
+        receiver.onEncryptedOfferDetailsReceived(checkNotNull(sender.createEncryptedOfferDetails()))
         val link = LinkInfoMessage(LinkType.LAN, "127.0.0.1", 8888)
         receiver.state.first { it is ReceiverState.AcceptPrompt }
         sender.onDecisionReceived(receiver.acceptTransfer(link), link)

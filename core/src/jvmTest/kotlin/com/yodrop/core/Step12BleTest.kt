@@ -98,7 +98,7 @@ class Step12BleTest {
     @Test
     fun fullUnicodeOfferSurvivesManyTinyGattFragments() {
         val original = OfferMessage(sid, ByteArray(32) { 12 }, 100, 1L shl 35,
-            "東京".repeat(70) + ".dat")
+            "東京".repeat(40))
         val encoded = BleMessageCodec.encode(original)
         val packets = BleFragmenter.fragment(42, encoded, 20)
         assertTrue(packets.size > 20)
@@ -110,7 +110,7 @@ class Step12BleTest {
         assertContentEquals(original.senderPubKey, decoded.senderPubKey)
         assertEquals(original.fileCount, decoded.fileCount)
         assertEquals(original.totalBytes, decoded.totalBytes)
-        assertEquals(original.previewName, decoded.previewName)
+        assertEquals(original.senderName, decoded.senderName)
     }
 
     private class Fixture(scope: CoroutineScope) {
@@ -171,9 +171,9 @@ class Step12BleTest {
         val f = Fixture(backgroundScope)
         f.discover()
         assertIs<ReceiverState.OfferSeen>(f.receiver.state.value)
-        assertIs<SenderState.Advertising>(f.sender.state.value)
+        assertIs<SenderState.Grabbed>(f.sender.state.value)
         assertFalse(f.sent.any { it is ClaimMessage })
-        assertEquals("Sender phone", f.receiving.peerName.value)
+        assertEquals("YoDrop", f.receiving.peerName.value)
         f.claim()
         runCurrent()
         val senderPrompt = assertIs<SenderState.AwaitAccept>(f.sender.state.value)
@@ -230,7 +230,7 @@ class Step12BleTest {
     }
 
     @Test
-    fun offerWithoutHelloAndActionsBeforeDiscoveryAreIgnored() = runTest {
+    fun offerBeforeScanningAndActionsBeforeDiscoveryAreIgnored() = runTest {
         val f = Fixture(backgroundScope)
         assertFalse(f.receiving.claim())
         assertFalse(f.receiving.accept())
