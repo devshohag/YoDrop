@@ -5,7 +5,7 @@ import com.yodrop.core.protocol.LinkInfoMessage
 import com.yodrop.core.protocol.LinkType
 import com.yodrop.core.session.ReceiverState
 import com.yodrop.core.session.ReceiverStateMachine
-import com.yodrop.core.transport.LanTransport
+import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -23,7 +23,14 @@ class AndroidReceiverLinkSetup(
 
     suspend fun prepare(link: LinkInfoMessage) {
         if (link.linkType == LinkType.LAN) {
-            receiver.attachConnection(LanTransport().connect(link))
+            mutex.withLock {
+                check(receiver.state.value is ReceiverState.Linking)
+                endpoint = link.copy(extra = link.extra.toMap())
+            }
+            try { connectWorkers() }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) { receiver.cancel("LAN connection failed. Check the Wi-Fi network."); throw failure }
+            Log.d("YoDropLink", "DATA_LINK_SELECTED LAN")
             return
         }
         if (link.linkType != LinkType.WIFI_DIRECT) return // Hotspot is Step 17.
@@ -41,6 +48,14 @@ class AndroidReceiverLinkSetup(
     }
 
     private suspend fun connectWorkers() {
+        val lan = mutex.withLock { endpoint?.takeIf { it.linkType == LinkType.LAN } }
+        if (lan != null) {
+            val connection = AndroidLanTransport(context).connect(lan)
+            var handedOff = false
+            try { receiver.attachConnection(connection); handedOff = true }
+            finally { if (!handedOff) withContext(NonCancellable) { connection.close() } }
+            return
+        }
         val (transport, link) = mutex.withLock { checkNotNull(wifiDirect) to checkNotNull(endpoint) }
         transport.group(link)
         // Shared receiver assigns missing chunks across authenticated sockets, including after reconnect.
@@ -57,7 +72,7 @@ class AndroidReceiverLinkSetup(
     }
 
     fun recover() {
-        if (recoveryJob?.isActive == true || wifiDirect == null) return
+        if (recoveryJob?.isActive == true || endpoint == null) return
         recoveryJob = scope.launch {
             while (isActive) {
                 if ((receiver.state.value as? ReceiverState.Failed)?.canResume == true) {

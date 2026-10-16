@@ -46,6 +46,11 @@ Receiver: app open, scanning → sees OFFER → 🖐 open palm (fist→palm) wit
 → link setup → encrypted TCP transfer → verify hash → DONE (haptic + sound)
 ```
 - Tap fallback ("Send" / "Receive" buttons) must always exist alongside gesture.
+- Approved A5: Android selects one or multiple files through the system document
+  picker, streams URI content, and saves verified received files automatically to
+  `Downloads/YoDrop` through MediaStore. No receive-folder prompt or broad storage
+  permission is required. Private `.part` staging precedes verified commit and
+  pending-row publication; unfinished files are not shown as completed downloads.
 - Multiple receivers: first CLAIM wins for single send; Group mode accepts all CLAIMs in the window.
 
 ## 5. Protocol
@@ -166,3 +171,10 @@ stop, public OFFER limited to five fields and encrypted post-CLAIM previewName,
 one GATT connection with per-session cache/read-disconnect, and Android MTU 247
 request with fragmentation. Both APKs must update together for the new UUIDs and
 OFFER/OFFER_DETAILS wire schema.
+
+## Approved A5 — 2026-10-16
+Owner selected automatic `Downloads/YoDrop` storage instead of a SAF-picked receive
+folder. Android API 29+ uses MediaStore.Downloads with RELATIVE_PATH and IS_PENDING;
+only fully copied, verified files are made visible. Sender SAF URI selection is
+independent of that destination decision. File names may receive a collision suffix
+from MediaStore; an existing download is never selected for overwrite.

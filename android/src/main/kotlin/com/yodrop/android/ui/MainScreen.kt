@@ -20,6 +20,7 @@ fun MainScreen(
     onAcceptClick: () -> Unit,
     onDenyClick: () -> Unit,
     onCancelClick: () -> Unit,
+    preparingFiles: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -36,12 +37,17 @@ fun MainScreen(
         )
 
         when {
+            preparingFiles -> {
+                CircularProgressIndicator()
+                Text("Preparing selected files...", modifier = Modifier.padding(top = 16.dp))
+                OutlinedButton(onClick = onCancelClick) { Text("Cancel") }
+            }
             senderState is SenderState.Idle && receiverState is ReceiverState.Idle -> {
                 Button(
                     onClick = onSendClick,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
                 ) {
-                    Text("Send File")
+                    Text("Send Files")
                 }
                 OutlinedButton(
                     onClick = onReceiveClick,
@@ -96,6 +102,8 @@ fun MainScreen(
             receiverState is ReceiverState.AcceptPrompt -> {
                 Text("From: ${peerName ?: "Nearby device"}")
                 Text("Incoming file: ${receiverState.previewName}")
+                Text("${receiverState.offer.fileCount} file(s), ${receiverState.offer.totalBytes} bytes")
+                Text("Save to Downloads/YoDrop")
                 Text(
                     text = receiverState.verifyCode,
                     style = MaterialTheme.typography.displayMedium,
@@ -152,6 +160,7 @@ fun MainScreen(
 
             senderState is SenderState.Done || receiverState is ReceiverState.Done -> {
                 Text("Transfer Complete!", style = MaterialTheme.typography.headlineMedium)
+                if (receiverState is ReceiverState.Done) Text("Saved in Downloads/YoDrop")
                 Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
                     Text("Back to Home")
                 }

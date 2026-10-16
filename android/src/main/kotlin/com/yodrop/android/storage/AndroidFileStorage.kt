@@ -1,127 +1,71 @@
 package com.yodrop.android.storage
 
-import android.content.Context
 import android.content.ContentValues
-import android.os.Build
+import android.content.Context
 import android.os.Environment
 import android.provider.MediaStore
-import com.yodrop.core.platform.DiskFileSink
-import com.yodrop.core.platform.FileSink
+import android.util.Log
+import com.yodrop.core.platform.*
 import com.yodrop.core.protocol.FileMeta
+import com.yodrop.core.protocol.ProtocolBounds
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.IOException
+import java.util.UUID
 
-/** Application context only: receive/publish remains valid after an Activity is destroyed. */
-class AndroidFileStorage(private val context: Context) {
+/** Approved A5: verified files appear automatically in Downloads/YoDrop on API 29+. */
+class AndroidFileStorage(context: Context) {
+    private val app = context.applicationContext
     fun createScopedStorageFileSink(meta: FileMeta): FileSink {
-        val tempFile = File(context.cacheDir, "yodrop_recv_${meta.id}.part")
-        val baseSink = DiskFileSink(meta.id, tempFile)
-
-        return object : FileSink {
-            override val fileId: String get() = baseSink.fileId
-
-            override suspend fun writeChunk(offset: Long, data: ByteArray) {
-                baseSink.writeChunk(offset, data)
-            }
-
-            override suspend fun force() = baseSink.force()
-
-            override suspend fun hasDataThrough(length: Long): Boolean =
-                baseSink.hasDataThrough(length)
-
-            override suspend fun verifySha256(expectedSha256: ByteArray): Boolean {
-                return baseSink.verifySha256(expectedSha256)
-            }
-
-            override suspend fun commit() {
-                baseSink.commit()
-                // Strict publish: will throw on error and will NEVER delete tempFile on failure
-                publishToMediaStore(baseSink.committedFile, meta.name, meta.mime)
-            }
-
-            override suspend fun discard() {
-                baseSink.discard()
-            }
-
-            override suspend fun close() {
-                baseSink.close()
-            }
-        }
+        ProtocolBounds.validateFile(meta)
+        // Remote file IDs/names never form private filesystem paths. Each receive gets unique staging.
+        val directory = File(app.filesDir, "incoming").apply { check(isDirectory || mkdirs()) { "Cannot create receive staging directory" } }
+        val target = File(directory, UUID.randomUUID().toString() + ".staged")
+        val staging = DiskFileSink(meta.id, target)
+        return PublishingFileSink(staging,
+            publish = { publish(staging.committedFile, meta) },
+            removeStaging = { withContext(Dispatchers.IO) {
+                val owned = runCatching { staging.committedFile }.getOrNull()
+                if (owned?.exists() == true && !owned.delete()) Log.w("YoDropStorage", "Receive staging cleanup unconfirmed")
+            } })
     }
 
-    @Throws(IOException::class)
-    private fun publishToMediaStore(sourceFile: File, displayName: String, mimeType: String) {
-        if (!sourceFile.exists()) {
-            throw IOException("Source file does not exist: ${sourceFile.absolutePath}")
+    private suspend fun publish(source: File, meta: FileMeta) = withContext(Dispatchers.IO) {
+        val resolver = app.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, meta.name)
+            put(MediaStore.Downloads.MIME_TYPE, meta.mime)
+            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/YoDrop")
+            put(MediaStore.Downloads.IS_PENDING, 1)
         }
-
-        var publishedSuccessfully = false
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: throw IOException("Cannot create received download")
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, displayName)
-                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/YoDrop")
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                    ?: throw IOException("Failed to insert MediaStore download record for $displayName")
-
-                try {
-                    resolver.openOutputStream(uri)?.use { out ->
-                        FileInputStream(sourceFile).use { input ->
-                            val buffer = ByteArray(64 * 1024)
-                            var read: Int
-                            while (input.read(buffer).also { read = it } != -1) {
-                                out.write(buffer, 0, read)
-                            }
-                            out.flush()
-                        }
-                    } ?: throw IOException("Failed to open output stream for URI: $uri")
-
-                    values.clear()
-                    values.put(MediaStore.Downloads.IS_PENDING, 0)
-                    val updatedRows = resolver.update(uri, values, null, null)
-                    if (updatedRows <= 0) {
-                        throw IOException("Failed to finalize pending status for URI: $uri")
+            resolver.openOutputStream(uri, "w")?.use { out ->
+                FileInputStream(source).use { input ->
+                    val buffer = ByteArray(64 * 1024)
+                    var copied = 0L
+                    while (true) {
+                        val n = input.read(buffer)
+                        if (n < 0) break
+                        out.write(buffer, 0, n)
+                        copied += n
                     }
-                    publishedSuccessfully = true
-                } catch (e: Exception) {
-                    resolver.delete(uri, null, null)
-                    throw e
+                    if (copied != meta.size) throw IOException("Receive staging length changed")
+                    out.flush()
                 }
-            } else {
-                val targetDir = File(
-                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                    "YoDrop"
-                )
-                if (!targetDir.exists() && !targetDir.mkdirs()) {
-                    throw IOException("Failed to create target directory: ${targetDir.absolutePath}")
-                }
-                val destFile = File(targetDir, displayName)
-                FileInputStream(sourceFile).use { input ->
-                    FileOutputStream(destFile).use { out ->
-                        val buffer = ByteArray(64 * 1024)
-                        var read: Int
-                        while (input.read(buffer).also { read = it } != -1) {
-                            out.write(buffer, 0, read)
-                        }
-                        out.flush()
-                    }
-                }
-                publishedSuccessfully = true
-            }
-
-            // ONLY delete the temporary file after verified, successful publish
-            if (publishedSuccessfully) {
-                sourceFile.delete()
-            }
-        } catch (t: Throwable) {
-            // Keep sourceFile intact on disk for recovery
-            throw if (t is IOException) t else IOException("Publishing failed for $displayName", t)
+            } ?: throw IOException("Cannot open received download")
+            values.clear()
+            values.put(MediaStore.Downloads.IS_PENDING, 0)
+            if (resolver.update(uri, values, null, null) != 1) throw IOException("Cannot publish received download")
+        } catch (failure: Exception) {
+            // Never reveal a partially copied download; preserve the original error if cleanup fails.
+            try { if (resolver.delete(uri, null, null) != 1) Log.w("YoDropStorage", "Pending download cleanup unconfirmed") }
+            catch (_: Exception) { Log.w("YoDropStorage", "Pending download cleanup unconfirmed") }
+            throw failure
         }
+        Log.d("YoDropStorage", "DOWNLOAD_PUBLISHED") // No filename, content URI or private preview.
     }
 }

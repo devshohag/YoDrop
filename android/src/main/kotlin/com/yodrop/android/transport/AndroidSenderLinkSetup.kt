@@ -51,6 +51,7 @@ class AndroidSenderLinkSetup(
                     else SenderLinkInfoFactory.lan(address, listener.localPort)
                 endpoint = info
                 acceptJob = acceptConnections(listener)
+                if (choice.linkType == LinkType.LAN) android.util.Log.d("YoDropLink", "DATA_LINK_SELECTED LAN")
                 info
             }
         }

@@ -667,3 +667,55 @@ MANUAL-TESTS.md. API 29/31/34 device results are not established by JVM tests.
 See STEP18-VALIDATION.md for executed checks and MANUAL-TESTS.md for pending
 Android API 29/31/34, permission and screen-off evidence. Source compilation and
 portable tests do not establish an APK build or background operation on hardware.
+
+## [A5 / Step 19] SAF sources, Downloads/YoDrop and actual LAN routing
+
+- Owner approved automatic MediaStore Downloads/YoDrop as A5 on 2026-10-16.
+  No receive directory picker, broad storage permission or legacy public-file write
+  is used (minSdk is 29). UI states the destination before acceptance and after Done.
+- Send Files uses OpenMultipleDocuments for one or multiple documents. Duplicate
+  URIs are deduplicated; a batch is limited to the protocol's 1000 files and total
+  chunk bound. Size/SHA-256 come from a 64 KiB streaming scan, not an untrusted or
+  nullable provider SIZE column. There is no sender cache copy or whole-file read.
+  Provider display names become protocol-valid bounded basenames; file IDs are
+  independently generated UUIDs, allowing duplicate display names in a batch.
+- AndroidSelectedDocuments owns SAF descriptors and attempts persistable read
+  grants. It releases only grants acquired by this selection on source close or
+  preparation failure/cancel; a previously held app grant is preserved. Providers
+  refusing persistence retain their temporary grant only; loss/move/delete or
+  mutation produces a defined transfer failure, not a fabricated sample file.
+  A process crash may leave a persisted grant; process-death session persistence
+  and orphan sweeps are not implemented by this step.
+- Shared RangeFileSource serializes bounded reads across transfer sockets and
+  caps allocations at 4 MiB. Regular full-file descriptors seek directly. AFD
+  subsections preserve their start offset/remaining-length semantics, and ESPIPE
+  providers use a persistent sequential reader, 64 KiB skips and reopen on a
+  backward retry. Nonseekable providers may be slower for out-of-order requests.
+  Read/seek failure and cancellation close the reader; source close is idempotent
+  and releases its owned grant. No whole document is retained in memory.
+- Preparing selected files is cancellable and blocks duplicate Send/Receive taps;
+  Activity destruction cancels preparation, releases its sources, and returns to
+  Idle. An atomic handoff gives accepted sources to Step 18's runtime. After that,
+  transfer ownership survives Activity recreation. Preparation is not advertised
+  and does not start the OFFER timeout before hashes are ready.
+- Receiver uses unique app-files staging paths independent of remote IDs/names.
+  DiskFileSink writes .part, the real receiver verifies SHA-256, and shared
+  PublishingFileSink commits staging before publishing. Android copies with a
+  64 KiB buffer to a newly inserted pending MediaStore download, checks byte count,
+  then clears IS_PENDING. Failures delete the pending row best-effort and propagate;
+  no successful FILE_DONE/Done precedes publication. Terminal discard removes
+  owned private staging; successful publication also removes it. Existing public
+  downloads are never opened for overwrite. Failed cleanup is logged unconfirmed.
+- Both BLE HELLO snapshots already carry LAN caps/IP; sender still owns selection
+  using its actual interface prefix and sends its real ephemeral listener endpoint
+  through encrypted LINK_INFO only after ACCEPT. Android now locates a unique
+  eligible Wi-Fi/Ethernet IPv4 network even if offline Wi-Fi is not the default.
+  Active VPNs and ambiguous candidates are not silently bypassed/guessed. Receiver
+  binds only its socket to that Network and local IP, without process-wide binding.
+  Same-subnet validation is repeated before connect. LAN recoverable loss reuses
+  the existing bounded reconnect observer; sender keeps its original listener.
+  Fixed DATA_LINK_SELECTED LAN logs permit device verification without credentials.
+- No dependency, SDK or protocol tag changed. Tiny BLE-only payload transport,
+  Share Sheet, gesture, group mode and iOS remain outside this remediation plan.
+  JVM and source compilation evidence is in STEP19-VALIDATION.md; actual SAF,
+  MediaStore and same-Wi-Fi 1 GiB device acceptance remain pending in MANUAL-TESTS.md.

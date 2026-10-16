@@ -395,3 +395,71 @@ the normal transfer UI; the hotspot diagnostic does not exercise this service.
 | Done / cancel / deny / timeout / error: no service or held locks | PENDING |
 | Wi-Fi loss: service retained for resume, stops on expiry | PENDING |
 | Rapid reset/restart and force-stop: no stale cancellation/restart | PENDING |
+
+## Step 19: selected documents, approved A5 Downloads and LAN auto-selection
+
+Status: **PENDING — no real SAF/MediaStore/two-phone result recorded.**
+Use Android API 29 and 34 devices (plus another model where possible), the normal
+Send Files/Receive tap flow, Bluetooth on, and both phones on the same Wi-Fi.
+The current tap flow discovers over BLE; same LAN does not replace BLE discovery.
+
+1. On sender, Send Files -> system Files/Gallery provider -> pick a local 1 GiB
+   video. Wait for Preparing selected files to finish, then pair/claim, compare
+   codes and Accept. Require no sample payload or sender source cache copy. Keep
+   the chosen file available/unmodified until Done. If hashing preparation is
+   cancelled or Activity recreated, require sources/grants released and Idle;
+   rotation during actual transfer must retain the Step 18 runtime session.
+2. Require DATA_LINK_SELECTED LAN on both phones, with no WFD group/hotspot
+   creation and no transport-selection prompt:
+
+   ```powershell
+   adb -s SENDER_SERIAL logcat -d -s 'YoDropLink:D' '*:S'
+   adb -s RECEIVER_SERIAL logcat -d -s 'YoDropLink:D' 'YoDropStorage:D' '*:S'
+   ```
+
+   Repeat with Wi-Fi having no Internet and mobile data enabled/default. Require
+   LAN logs, Done and matching SHA-256. If router client isolation/firewall blocks
+   TCP, record that failure; being on an SSID alone does not prove LAN reachability.
+3. Receiver accept prompt must say Downloads/YoDrop. During transfer no completed
+   download should be visible for an unfinished file. After Done, Files ->
+   Downloads -> YoDrop contains the video with exact bytes/hash. For a desktop
+   check, copy/pull both originals and received files privately, then:
+
+   ```powershell
+   # For ordinary primary-storage MediaStore downloads; use the actual collision-adjusted filename.
+   adb -s RECEIVER_SERIAL pull /sdcard/Download/YoDrop/ACTUAL_VIDEO.mp4 D:\Temp\received-step19.mp4
+   Get-FileHash D:\Temp\original-step19.mp4 -Algorithm SHA256
+   Get-FileHash D:\Temp\received-step19.mp4 -Algorithm SHA256
+   (Get-Item D:\Temp\received-step19.mp4).Length
+   ```
+
+   Expect 1073741824 bytes and equal hashes for an exactly 1 GiB input. Local unit
+   tests do not establish MediaStore publication on an Android phone.
+4. Pick several files together, including duplicate display names from different
+   folders, Unicode names, an empty file and a large file. Total batch must be
+   >=64 KiB because BLE-only small-payload transport is future P10. Require correct
+   OFFER file count/bytes, no source overwrite, all files published and hashes
+   equal. Repeat the same receive name twice: existing Downloads content must
+   remain intact and a distinct MediaStore entry must be created.
+5. Try a provider without a reported SIZE, a pipe/subsection provider if available,
+   cancelled picker, Cancel while preparing, revoked/moved/deleted selected file,
+   receive cancel and low-storage/publish error. Require bounded memory, defined
+   error/cancel, no false Done and no completed partial download. Inspect private
+   incoming .part/.staged files with `adb shell run-as com.yodrop.android ls files/incoming`
+   on the debug APK; terminal cleanup should remove owned staging. Already completed
+   files in a partially successful multi-file batch are retained.
+6. Toggle Wi-Fi briefly during LAN data transfer and restore the same LAN within
+   the reconnect window. Require the same session and bitmap resume, matching hash,
+   and final service/lock cleanup. Test different subnets and active VPN: require
+   no guessed LAN selection or silent VPN bypass. No physical speed is inferred
+   from loopback test timing.
+
+| Device / observation | Result / nonsensitive evidence |
+| --- | --- |
+| API 29 model/provider: selected 1 GiB video -> Downloads/YoDrop, SHA-256 | PENDING |
+| API 34 model/provider: SAF read, MediaStore pending/final publication | PENDING |
+| Same Wi-Fi selects LAN on both phones, real data completes | PENDING |
+| Offline Wi-Fi + mobile default: bound LAN socket completes | PENDING |
+| Multi-file, duplicate/Unicode names, zero-byte file, no overwrite | PENDING |
+| Cancel/preparation rotation/revoked file/low-storage error cleanup | PENDING |
+| LAN drop/resume, then no retained service/locks/staging | PENDING |

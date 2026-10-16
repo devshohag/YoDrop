@@ -2,6 +2,7 @@ package com.yodrop.android.transport
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import com.yodrop.core.protocol.HelloMessage
 import com.yodrop.core.protocol.Platform
@@ -15,8 +16,7 @@ class AndroidSenderTransportSelector(
     context: Context,
     private val sender: SenderStateMachine
 ) {
-    private val connectivity = context.applicationContext
-        .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+    private val app = context.applicationContext
 
     suspend fun selectTransport(
         senderCapabilities: Int,
@@ -30,19 +30,30 @@ class AndroidSenderTransportSelector(
         peerIp = peerIp
     )
 
-    fun activeLanAddress(): LanAddress? {
-        val manager = connectivity ?: return null
-        val network = manager.activeNetwork ?: return null
-        val capabilities = manager.getNetworkCapabilities(network) ?: return null
-        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
-            !(capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) return null
-        val properties = manager.getLinkProperties(network) ?: return null
-        val local = properties.linkAddresses.firstOrNull {
-            it.address is Inet4Address && !it.address.isLoopbackAddress &&
-                !it.address.isAnyLocalAddress && !it.address.isLinkLocalAddress
-        } ?: return null
-        val ip = local.address.hostAddress ?: return null
-        return LanAddress(ip, local.prefixLength)
+    fun activeLanAddress(): LanAddress? = AndroidLanNetwork.current(app)?.address
+}
+
+/** A real interface snapshot, including Wi-Fi without Internet when mobile data is the default. */
+data class AndroidLanNetwork(val network: Network, val address: LanAddress) {
+    companion object {
+        fun current(context: Context): AndroidLanNetwork? {
+            val manager = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
+            val active = manager.activeNetwork
+            // Do not silently bypass an active VPN with a local socket.
+            if (active != null && manager.getNetworkCapabilities(active)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return null
+            fun candidate(network: Network): AndroidLanNetwork? {
+                val caps = manager.getNetworkCapabilities(network) ?: return null
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                    !(caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) return null
+                val addresses = manager.getLinkProperties(network)?.linkAddresses.orEmpty().filter {
+                    it.address is Inet4Address && !it.address.isLoopbackAddress && !it.address.isAnyLocalAddress && !it.address.isLinkLocalAddress
+                }
+                val local = addresses.singleOrNull() ?: return null
+                return AndroidLanNetwork(network, LanAddress(local.address.hostAddress ?: return null, local.prefixLength))
+            }
+            active?.let { candidate(it)?.let { result -> return result } }
+            @Suppress("DEPRECATION")
+            return manager.allNetworks.mapNotNull { candidate(it) }.singleOrNull()
+        }
     }
 }
