@@ -28,7 +28,7 @@ and grant the requested Bluetooth permissions (location for scanning on API 29/3
 4. Compare the codes before tapping Accept. Both phones should reach the linking
    screen. Pairing/code agreement alone is not proof of a file transfer. Step 14+
    wires actual LAN setup after encrypted LINK_INFO; use its separate file/hash
-   checklist below. Wi-Fi Direct is wired as of Step 16; hotspot remains Step 17.
+   checklist below. Wi-Fi Direct is wired as of Step 16; Android hotspot sender setup is wired as of Step 17; iOS joining is later work.
 5. Reset both apps and repeat, choosing Deny at the receiver prompt. Receiver
    should show cancellation; sender should show receiver-denied failure.
 6. Repeat Cancel/Back to Home and discover again. Record any missing OFFER,
@@ -148,8 +148,8 @@ Status: **PENDING - no physical Android transfer result recorded.**
 | Deny prevented endpoint/data setup | PENDING |
 | Matching-code/GATT probe regression on updated APKs | PENDING |
 
-LAN and Android Wi-Fi Direct endpoint setup are now wired. Hotspot still awaits
-Step 17, and small BLE payload data is later work. A pairing/code
+LAN, Android Wi-Fi Direct and Android hotspot sender endpoint setup are now wired.
+iOS hotspot joining and small BLE payload data are later work. A pairing/code
 match on different networks does not establish those data links. No hotspot
 credentials should be printed in logcat, error messages or state dumps.
 
@@ -263,3 +263,62 @@ or place them on different subnets, while leaving Wi-Fi radios enabled.
 | Cancel/create/join/transfer, Deny, Done: group cleanup | PENDING |
 | Denied permission / Wi-Fi off / Location off | PENDING |
 | Unrelated existing group preserved | PENDING |
+
+## Step 17: hotspot configuration, actual interface IP and release
+
+Status: **PENDING — no API 29/31/34 hotspot result recorded.**
+This debug-only probe exercises the real Android manager without implementing or
+requiring an iOS receiver. Use a debug APK on each physical Android API 29, 31 and
+34 device; enable Wi-Fi, Bluetooth and Location and grant requested permissions.
+Ensure another app is not already holding a local-only hotspot reservation.
+
+```powershell
+$phone = 'PHONE_SERIAL'
+adb -s $phone install -r .\android\build\outputs\apk\debug\android-debug.apk
+adb -s $phone shell am force-stop com.yodrop.android
+adb -s $phone logcat -c
+adb -s $phone shell am start -n com.yodrop.android/.MainActivity `
+    --ez yodrop_hotspot_probe true
+```
+
+1. Tap Start hotspot. Require Hotspot started and an actual gateway/ephemeral port.
+   API 29 must use the legacy config branch without a null crash; API 31/34 use
+   reservation SoftApConfiguration. No fallback SSID/password/address is acceptable.
+2. Tap Show join details privately; on another phone or PC, join the shown network
+   using its actual passphrase. Do not capture/share passwords in screenshots/logs.
+   On the joined PC, use the displayed gateway and port:
+
+   ```powershell
+   Test-NetConnection -ComputerName 'ACTUAL_GATEWAY' -Port ACTUAL_PORT
+   adb -s $phone logcat -d -s 'YoDropHotspot:D' '*:S'
+   ```
+
+   Require TcpTestSucceeded=True plus HOTSPOT_PROBE TCP_REACHABLE. Verify the
+   gateway corresponds to the device's actual hotspot interface/address, not its
+   upstream Wi-Fi/mobile address. Record nonsensitive IP/port and results only.
+3. Tap Stop / cancel. Require HOTSPOT_RESERVATION released=true and the test network
+   disappears after teardown when this app was the sole requester. Repeat rapid
+   Start then Stop while Starting to cover a late onStarted callback. Also test
+   Back/Activity destruction. Repeated Start after Stop must work with a fresh
+   reservation. 'Hotspot release unconfirmed' is not a successful cleanup result.
+4. Disable Location/Wi-Fi or deny the relevant permission, then retry. Require a
+   defined failure and no retained reservation. Null/missing configurations and
+   ambiguous/no-new-address cases are also covered at the portable callback boundary
+   by JVM tests. A shared existing LOHS may be rejected because its interface/IP
+   already existed before the request; do not interpret that as a successful probe.
+5. Check logs contain no SSID/passphrase. Normal launch without the extra must show
+   the normal app screen; release APK must ignore the probe extra.
+6. Sender terminal-hook unit tests cover cancellation/link timeout. Normal hotspot
+   sender setup is wired after ACCEPT, but physical Android-to-iOS Done/deny/transfer
+   checks remain pending the later iOS implementation; the diagnostic is not a file
+   transfer or encrypted TCP acceptance result.
+
+| Device / observation | Result / nonsensitive evidence |
+| --- | --- |
+| API 29 model: credentials, actual IP, TCP reachable, cancel | PENDING |
+| API 31 model: SoftApConfiguration, IP, TCP reachable, cancel | PENDING |
+| API 34 model: Nearby Wi-Fi, config/IP, TCP reachable, cancel | PENDING |
+| Rapid cancel before callback; Back closes reservation | PENDING |
+| Start/stop/restart and no remaining sole-owned hotspot | PENDING |
+| Denied permissions / disabled prerequisites | PENDING |
+| No credentials in logs; probe absent in normal/release flow | PENDING |

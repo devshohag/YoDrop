@@ -578,3 +578,45 @@ remain PENDING; this is compatibility preparation, not an implemented iOS sender
 Local verification and pending device evidence are in STEP16-VALIDATION.md.
 P4 hardware throughput/resume acceptance and Step 18 foreground service remain
 pending; passing JVM/socket tests does not establish a working radio link.
+
+## [Step 17] Reservation-backed hotspot configuration, address and cleanup
+
+- Replaced the old guessed gateway, fallback SSID and default listener port.
+  AndroidHotspotManager is now a one-reservation/session manager. API 30+ reads the
+  reservation's SoftApConfiguration; API 29 alone uses nullable WifiConfiguration.
+  Null configuration, missing/invalid SSID/passphrase and open/unsupported security
+  configurations fail with fixed credential-free errors, releasing the reservation.
+  The obsolete RequiresApi(O) annotation is removed (minSdk remains 29).
+- Shared HotspotSession owns the callback lease lifecycle, 12-second startup/address
+  deadline, validation, idempotent close and late-callback disposal. Cancel, timeout,
+  failure and onStopped retire the lease; a later onStarted immediately closes its
+  reservation even if the Activity/start coroutine has gone away. Public Android
+  APIs do not offer pre-callback cancellation of a pending LOHS request; no hidden
+  API/reflection is used. Reservation.close releases only this app's ownership.
+- Gateway discovery uses actual NetworkInterface IPv4/prefix snapshots before and
+  after startup. It excludes existing addresses, active-network/upstream addresses,
+  down/loopback/point-to-point interfaces, link-local/multicast/network/broadcast
+  addresses. Exactly one new eligible address is required; it can arrive after
+  onStarted. There is no interface-name/subnet constant. An existing shared hotspot
+  with no new observable address, or ambiguous changes, fails instead of guessing.
+  Public LOHS callbacks do not expose a downstream interface name: this conservative
+  snapshot method still requires physical verification on OEM devices.
+- Sender HOTSPOT preparation now runs only after ACCEPT, using its real ephemeral
+  listener port. Actual credentials/gateway go through the existing encrypted
+  LINK_INFO; the receiver never invents an address. A stopped hotspot cancels the
+  sender session. The existing sender terminal cleanup hook stops its reservation,
+  closes the listener and joins workers on Done/cancel/failure/timeout/reset.
+- Nearby Wi-Fi permission is requested on API 33+ even without Wi-Fi Direct hardware;
+  <=32 uses fine location. Manager checks Wi-Fi, Location Mode and permission before
+  startup, without enabling radios. No dependencies, minSdk or protocol tags changed.
+- Debug APK + explicit yodrop_hotspot_probe intent extra exposes a diagnostic screen
+  for start/cancel, actual gateway/ephemeral port, and an optional owner-only join
+  details display. Its listener accepts/closes a TCP connection solely to prove
+  reachability. Logs never contain SSID/passphrase; reservation release is logged
+  only after close succeeds, otherwise release is marked unconfirmed. This probe
+  is ignored by release builds and absent from the normal app flow.
+- iOS joining/NEHotspotConfiguration and Android-to-iOS data acceptance remain outside
+  this remediation step. The sender manager/path is implemented, not an iOS app.
+
+Executed verification and pending device rows are in STEP17-VALIDATION.md and
+MANUAL-TESTS.md. API 29/31/34 device results are not established by JVM tests.

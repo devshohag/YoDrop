@@ -13,6 +13,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.lifecycleScope
+import com.yodrop.android.transport.hotspot.HotspotProbe
+import com.yodrop.android.transport.hotspot.HotspotProbeScreen
 import com.yodrop.android.ui.MainScreen
 import com.yodrop.android.ble.AndroidBleManager
 import com.yodrop.android.transport.AndroidSenderTransportSelector
@@ -59,6 +61,7 @@ class MainActivity : ComponentActivity() {
     }
 
 
+    private var hotspotProbe: HotspotProbe? = null
     private lateinit var ble: AndroidBleManager
     private lateinit var handshake: BleHandshakeController
     private lateinit var receiverLinkSetup: AndroidReceiverLinkSetup
@@ -153,6 +156,13 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        if (debug && intent.getBooleanExtra("yodrop_hotspot_probe", false)) {
+            val probe = HotspotProbe(this, lifecycleScope)
+            hotspotProbe = probe
+            setContent { HotspotProbeScreen(probe) { withBlePermissions { probe.start() } } }
+            return
+        }
+
         setContent {
             val senderState by senderMachine.state.collectAsState()
             val receiverState by receiverMachine.state.collectAsState()
@@ -212,7 +222,7 @@ class MainActivity : ComponentActivity() {
                 Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_ADVERTISE,
                 Manifest.permission.BLUETOOTH_CONNECT))
             if (Build.VERSION.SDK_INT <= 32) add(Manifest.permission.ACCESS_FINE_LOCATION)
-            if (Build.VERSION.SDK_INT >= 33 && packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_DIRECT))
+            if (Build.VERSION.SDK_INT >= 33)
                 add(Manifest.permission.NEARBY_WIFI_DEVICES)
         }.toTypedArray()
         val missing = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
@@ -237,6 +247,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        hotspotProbe?.stop()
         if (::ble.isInitialized) ble.close()
         super.onDestroy()
     }

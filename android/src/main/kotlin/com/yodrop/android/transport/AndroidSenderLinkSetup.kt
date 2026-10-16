@@ -1,6 +1,7 @@
 package com.yodrop.android.transport
 
 import android.content.Context
+import com.yodrop.android.transport.hotspot.AndroidHotspotManager
 import com.yodrop.core.platform.PlatformServerSocket
 import com.yodrop.core.platform.createPlatformServerSocket
 import com.yodrop.core.protocol.LinkInfoMessage
@@ -22,6 +23,8 @@ class AndroidSenderLinkSetup(
     private val context: Context
 ) {
     private val mutex = Mutex()
+    private var hotspot: AndroidHotspotManager? = null
+    private var hotspotWatchJob: Job? = null
     private var wifiDirect: WifiDirectTransport? = null
     private var recoveryJob: Job? = null
     private var server: PlatformServerSocket? = null
@@ -29,6 +32,7 @@ class AndroidSenderLinkSetup(
     private var endpoint: LinkInfoMessage? = null
 
     suspend fun prepare(choice: TransportSelection): LinkInfoMessage? {
+        if (choice == TransportSelection.DataLink(LinkType.HOTSPOT)) return prepareHotspot()
         if (choice !is TransportSelection.DataLink || choice.linkType !in setOf(LinkType.LAN, LinkType.WIFI_DIRECT)) return null
         val wfd = if (choice.linkType == LinkType.WIFI_DIRECT) mutex.withLock {
             wifiDirect ?: WifiDirectTransport(context, owner = true).also { wifiDirect = it }
@@ -46,21 +50,50 @@ class AndroidSenderLinkSetup(
                 val info = if (wfd != null) wfd.endpoint(checkNotNull(group), listener.localPort)
                     else SenderLinkInfoFactory.lan(address, listener.localPort)
                 endpoint = info
-                acceptJob = scope.launch(Dispatchers.IO) {
-                    try {
-                        while (isActive) {
-                            val connection = TcpConnection(listener.accept())
-                            sender.attachConnection(connection) // Rejected/extra sockets close themselves; keep listening for resume.
-                        }
-                    } catch (cancelled: CancellationException) { throw cancelled }
-                    catch (_: Exception) {
-                        if (sender.state.value is SenderState.Linking || sender.state.value is SenderState.Auth ||
-                            sender.state.value is SenderState.Transferring) sender.cancel("Data listener failed")
-                    }
-                }
+                acceptJob = acceptConnections(listener)
                 info
             }
         }
+    }
+
+    private fun acceptConnections(listener: PlatformServerSocket) = scope.launch(Dispatchers.IO) {
+        try {
+            while (isActive) sender.attachConnection(TcpConnection(listener.accept()))
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) {
+            if (sender.state.value is SenderState.Linking || sender.state.value is SenderState.Auth ||
+                sender.state.value is SenderState.Transferring) sender.cancel("Data listener failed")
+        }
+    }
+
+    private suspend fun prepareHotspot(): LinkInfoMessage? {
+        val resources = withContext(Dispatchers.IO) {
+            mutex.withLock {
+                if (sender.state.value !is SenderState.Linking) return@withLock null
+                check(server == null && hotspot == null) { "A data link is already active" }
+                val listener = createPlatformServerSocket(0)
+                val manager = AndroidHotspotManager(context)
+                server = listener
+                hotspot = manager
+                listener to manager
+            }
+        } ?: return null
+        val (listener, manager) = resources
+        try {
+            val credentials = manager.startLocalHotspot(listener.localPort)
+            return mutex.withLock {
+                if (sender.state.value !is SenderState.Linking || hotspot !== manager) return@withLock null
+                val info = SenderLinkInfoFactory.hotspot(credentials)
+                endpoint = info
+                acceptJob = acceptConnections(listener)
+                hotspotWatchJob = scope.launch {
+                    manager.awaitStopped()
+                    sender.cancel("Hotspot stopped")
+                }
+                info
+            }
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (failure: Exception) { sender.cancel("Hotspot setup failed. Check Wi-Fi, Location and permissions."); throw failure }
     }
 
     fun recover() {
@@ -79,6 +112,10 @@ class AndroidSenderLinkSetup(
     suspend fun close() = withContext(NonCancellable) {
         recoveryJob?.cancelAndJoin()
         recoveryJob = null
+        hotspotWatchJob?.cancelAndJoin()
+        hotspotWatchJob = null
+        val localHotspot = mutex.withLock { hotspot.also { hotspot = null } }
+        localHotspot?.stopLocalHotspot()
         val transport = mutex.withLock { wifiDirect.also { wifiDirect = null } }
         transport?.close()
         val job = mutex.withLock {
