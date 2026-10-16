@@ -322,3 +322,76 @@ adb -s $phone shell am start -n com.yodrop.android/.MainActivity `
 | Start/stop/restart and no remaining sole-owned hotspot | PENDING |
 | Denied permissions / disabled prerequisites | PENDING |
 | No credentials in logs; probe absent in normal/release flow | PENDING |
+
+## Step 18: foreground service, permissions and screen-off transfer
+
+Status: **PENDING — requires physical Android API 29/31/34 devices.**
+Build success and JVM tests do not satisfy these rows. Use two real phones with
+the normal transfer UI; the hotspot diagnostic does not exercise this service.
+
+1. Run both source checks, build, then audit the generated merged manifest:
+
+   ```powershell
+   & .\scripts\check-common-main.ps1
+   & .\scripts\check-android-manifest.ps1
+   .\gradlew.bat clean :core:jvmTest :android:assembleDebug --console=plain --no-daemon
+   Get-ChildItem .\android\build\intermediates\merged_manifests -Recurse -Filter AndroidManifest.xml |
+       ForEach-Object { & .\scripts\check-android-manifest.ps1 -ManifestPath $_.FullName }
+   ```
+
+   Require the merged debug manifest audit to run and pass, not an empty pipeline.
+   If AGP uses a different intermediate directory, locate its debug merged manifest
+   and pass that absolute path. Do not audit a manifest from another build variant.
+2. Fresh install: deny required Nearby Devices/location permission, then retry.
+   Require no session/service, settings guidance and no crash. Grant permission
+   and retry. API 31/32 must request fine+coarse together; approximate-only must
+   not be treated as the precise permission required by Wi-Fi discovery. API 33+
+   requires Nearby Wi-Fi and BLE, not location. Deny POST_NOTIFICATIONS alone:
+   transfer must work with its foreground entry in Android's Active apps/Task
+   Manager, even if the drawer notification is hidden. Grant notifications in
+   Settings to test its content/open/cancel actions. No filename/credential in it.
+3. Start with Bluetooth off, then Wi-Fi off. Require a system Bluetooth enable
+   prompt and Wi-Fi settings panel. Refusing/cancelling must leave transfer
+   unstarted; enabling then retrying starts normally. The app must not toggle them.
+4. Start a real transfer large enough to remain active for at least five minutes.
+   After data begins, press Home and turn both screens off. Wait at least five
+   minutes, then return. Require continued progress, eventual Done and matching
+   SHA-256, without a new CLAIM/session. A transfer finishing before five minutes
+   is not evidence of five-minute background survival; use a larger file. Record
+   model/API, start/end times and hash. Test rotation/recreation during linking
+   and data: returning must show the same session, not Idle or a new advertisement.
+5. Open the ongoing notification: require the current session UI. Cancel from the
+   notification with UI backgrounded: require cancellation/transport cleanup on
+   both peers. Repeat Done, UI Cancel, Deny, offer/accept timeout and unrecoverable
+   error. During data, toggle Wi-Fi and recover within the existing reconnect
+   window; service/locks should stay through recoverable loss, then disappear on
+   Done or expiry. Bluetooth off during pairing must cancel with guidance.
+6. After each terminal path, inspect:
+
+   ```powershell
+   $phone = 'PHONE_SERIAL'
+   adb -s $phone shell dumpsys activity services com.yodrop.android
+   adb -s $phone shell dumpsys power | Select-String 'YoDrop:transfer'
+   adb -s $phone shell dumpsys wifi | Select-String 'YoDrop:transfer'
+   adb -s $phone logcat -d -s 'YoDropService:D' '*:S'
+   ```
+
+   Require no active ServiceRecord for TransferForegroundService, no held YoDrop
+   wake/Wi-Fi lock, notification gone, and FOREGROUND_STOPPED locksReleased=true.
+   Dumpsys may retain historical Wi-Fi lock statistics; distinguish those from a
+   currently held lock. A release-unconfirmed warning is not successful cleanup.
+   Repeat start/cancel/reset/start rapidly to catch old service destroy callbacks.
+   Force-stop mid-transfer: no automatic service/session resurrection is expected;
+   relaunch starts fresh, as START_NOT_STICKY does not implement process-death resume.
+
+| Device / observation | Result / nonsensitive evidence |
+| --- | --- |
+| API 29 model: location/radios, 5 min screen-off, hash, cleanup | PENDING |
+| API 31 model: BLE+fine/coarse, rotation, screen-off, cleanup | PENDING |
+| API 34 model: Nearby Wi-Fi, notifications allowed/denied, screen-off | PENDING |
+| Source and merged debug manifest audit | PENDING on owner build |
+| Required permission denied / radio dialog refused | PENDING |
+| Notification opens session and background Cancel cleans both peers | PENDING |
+| Done / cancel / deny / timeout / error: no service or held locks | PENDING |
+| Wi-Fi loss: service retained for resume, stops on expiry | PENDING |
+| Rapid reset/restart and force-stop: no stale cancellation/restart | PENDING |

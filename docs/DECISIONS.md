@@ -620,3 +620,50 @@ pending; passing JVM/socket tests does not establish a working radio link.
 
 Executed verification and pending device rows are in STEP17-VALIDATION.md and
 MANUAL-TESTS.md. API 29/31/34 device results are not established by JVM tests.
+
+## [Step 18] Foreground transfer ownership, permissions and power
+
+- A process-scoped TransferRuntime owns both real state machines, BLE handshake,
+  discovery and link setup. It uses application context and a supervised Main
+  scope. Activity recreation/destruction detaches UI only; claim/accept/cancel
+  actions run in the runtime scope. Preparing a selected file remains streaming
+  IO before transfer, with a cancellation-safe ownership handoff. The receive/
+  publish adapter moved to AndroidFileStorage without changing destination policy.
+  Step 19 URI/multi-file/destination work is not implied by this move.
+- A visible Send/Receive action requests the foreground service before discovery.
+  State observation never launches it from the background. It stays for discovery,
+  consent, connection, data, verification and recoverable loss, and stops on all
+  terminal states (Done, cancel/deny, timeout, nonresumable failure) or return to
+  Idle. A terminal peer cannot stop an active other role. Old destroy callbacks
+  carry a generation guard so they cannot cancel a newer session. No session is
+  persisted/restarted after process death: START_NOT_STICKY is deliberate.
+- TransferForegroundService promptly calls ServiceCompat.startForeground with
+  FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE. Its ongoing low-priority notification
+  opens the current UI and offers Cancel. Text contains no filename, private
+  preview, address or credential. Partial CPU and high-performance Wi-Fi locks
+  cover linking/auth/data/verification and the bounded reconnect period, not idle
+  discovery/consent. Terminal state and service destruction release both; failed
+  release is logged as unconfirmed, never reported as success. OEM/doze screen-off
+  behavior still requires the physical five-minute test.
+- Runtime permissions follow SDK cutovers: API 31+ BLE Scan/Advertise/Connect,
+  API <=32 fine AND coarse location together (Android 12 requires a combined
+  request), API 33+ Nearby Wi-Fi and optional POST_NOTIFICATIONS. Missing required
+  permission blocks start and offers app settings. Denied notifications do not
+  block foreground transfer; Android 13+ still shows its foreground-service Task
+  Manager entry, while the notification drawer entry may be absent. The optional
+  notification prompt is not repeatedly shown on each action.
+- Before start, disabled Bluetooth uses the system enable dialog; disabled Wi-Fi
+  uses Settings.Panel.ACTION_WIFI. Cancellation/off after the dialog leaves the
+  session unstarted. No radio-enable/disable APIs are called. Radio events during
+  a session alert the UI; Bluetooth off cancels pre-data pairing, while Wi-Fi loss
+  retains the existing bounded data reconnect behavior. Revoked BLE permission
+  becomes a defined cancellation.
+- Manifest allowBackup=false; WAKE_LOCK is declared alongside the existing
+  foreground/connected-device permissions and nonexported connectedDevice service.
+  scripts/check-android-manifest.ps1 audits permissions, SDK bounds, location flags,
+  backup and service declarations, accepting an optional merged-manifest path.
+  No dependency, target/min SDK or wire protocol changed.
+
+See STEP18-VALIDATION.md for executed checks and MANUAL-TESTS.md for pending
+Android API 29/31/34, permission and screen-off evidence. Source compilation and
+portable tests do not establish an APK build or background operation on hardware.

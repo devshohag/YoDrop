@@ -31,8 +31,8 @@ class AndroidBleManager(
     private val context: Context,
     private val scope: CoroutineScope,
     private val localHello: HelloMessage,
-    private val requestedMtu: Int = 247,
-    private val diagnosticsEnabled: Boolean = false,
+    private var requestedMtu: Int = 247,
+    private var diagnosticsEnabled: Boolean = false,
     private val helloSnapshot: (() -> HelloMessage)? = null,
     private val senderState: () -> SenderState = { SenderState.Idle }
 ) {
@@ -87,6 +87,13 @@ class AndroidBleManager(
     private fun clientKey(peer: String) = "client:$peer"
     private fun serverKey(peer: String) = "server:$peer"
     private fun key(peer: String, operation: String) = GattOperationKey(peer, operation)
+    fun configureDiagnostics(mtu: Int, enabled: Boolean) {
+        require(mtu in 23..517)
+        if (activeGattClient == null && serverPeers.isEmpty() && advertisingSession == null && !scanning) {
+            requestedMtu = mtu
+            diagnosticsEnabled = enabled
+        }
+    }
     fun isBluetoothEnabled(): Boolean = adapter?.isEnabled == true
 
     private fun launchWork(epoch: Long = generation, block: suspend () -> Unit): Job =
