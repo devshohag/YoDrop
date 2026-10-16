@@ -28,7 +28,7 @@ and grant the requested Bluetooth permissions (location for scanning on API 29/3
 4. Compare the codes before tapping Accept. Both phones should reach the linking
    screen. Pairing/code agreement alone is not proof of a file transfer. Step 14+
    wires actual LAN setup after encrypted LINK_INFO; use its separate file/hash
-   checklist below. Other transport types remain pending Steps 16/17.
+   checklist below. Wi-Fi Direct is wired as of Step 16; hotspot remains Step 17.
 5. Reset both apps and repeat, choosing Deny at the receiver prompt. Receiver
    should show cancellation; sender should show receiver-denied failure.
 6. Repeat Cancel/Back to Home and discover again. Record any missing OFFER,
@@ -148,8 +148,8 @@ Status: **PENDING - no physical Android transfer result recorded.**
 | Deny prevented endpoint/data setup | PENDING |
 | Matching-code/GATT probe regression on updated APKs | PENDING |
 
-Only LAN endpoint setup is currently wired in Android. Wi-Fi Direct and hotspot
-still await Steps 16/17, and small BLE payload data is later work. A pairing/code
+LAN and Android Wi-Fi Direct endpoint setup are now wired. Hotspot still awaits
+Step 17, and small BLE payload data is later work. A pairing/code
 match on different networks does not establish those data links. No hotspot
 credentials should be printed in logcat, error messages or state dumps.
 
@@ -199,3 +199,67 @@ Keep apps foreground. Use a BLE scanner app on a separate phone where available.
 | Updated same-LAN transfer and SHA-256 | PENDING |
 
 No iOS physical discovery or background advertising result is claimed.
+
+## Step 16: physical Android Wi-Fi Direct (P4 transport acceptance)
+
+Status: **PENDING — no physical Wi-Fi Direct result recorded.**
+Use the same Step 16+ APK on two physical Wi-Fi Direct phones. Keep both foreground
+(the foreground-service work is Step 18). Enable Bluetooth, Wi-Fi and Location
+Mode; grant Nearby Wi-Fi on API 33+, or fine location on API 29–32. Do not turn off
+Wi-Fi to avoid LAN selection: disconnect both phones from infrastructure Wi-Fi,
+or place them on different subnets, while leaving Wi-Fi radios enabled.
+
+1. Select a real file >=64 KiB (small BLE payload data is later work). Receive,
+   Claim, compare codes, then Accept. No WFD group should exist before Accept.
+   Capture logs on each phone:
+
+   ```powershell
+   adb -s SENDER_SERIAL logcat -d -s 'YoDropWFD:D' '*:S'
+   adb -s RECEIVER_SERIAL logcat -d -s 'YoDropWFD:D' '*:S'
+   ```
+
+   Require P2P_READY owner=true on sender and owner=false on receiver. On 5 GHz
+   hardware, record frequencyMHz in the 5 GHz range; an AUTO/2.4 GHz result is not
+   proof of the 5 GHz test. Settings/adb dumpsys wifip2p can corroborate role/group;
+   do not publish raw dumps containing private credentials.
+2. Transfer a **1 GiB file**, time the data transfer and final verification, record
+   exact bytes and seconds, and compare original/received SHA-256 on PC:
+
+   ```powershell
+   Get-FileHash -Algorithm SHA256 'D:\test-data\original.bin'
+   Get-FileHash -Algorithm SHA256 'D:\test-data\received.bin'
+   # Substitute measured duration; decimal MB/s = bytes / 1,000,000 / seconds.
+   $elapsedSeconds = 70.0
+   (Get-Item 'D:\test-data\original.bin').Length / 1000000 / $elapsedSeconds
+   ```
+
+   Require >=15 MB/s on the recorded 5 GHz pair. Record failure/band/duration if
+   below target; JVM loopback speed is not an Android throughput result.
+3. Repeat with a new 1 GiB session. Around 40% progress, briefly toggle receiver
+   Wi-Fi off/on in Settings; keep Bluetooth/apps foreground. Restore it within the
+   existing reconnect budget. Expect Reconnecting then resume on the same session,
+   without selecting the file or Accept again; final SHA-256 must match. Repeat
+   toggling sender Wi-Fi, verifying sender remains owner after group recreation.
+   If the owner IP changes or the deadline expires, record that failure and reset;
+   the app must not guess a new endpoint or reuse credentials for a new peer.
+4. Repeat Cancel while creating a group, Cancel while joining, Cancel mid-transfer,
+   Deny before setup, and normal Done. Require no active group/discovery after each
+   terminal path and P2P_CLEANUP confirmed=true for a group that was started. A
+   'Group removal not confirmed' warning is a failed/unconfirmed cleanup result.
+5. Disable Wi-Fi/Location or deny the relevant runtime permission. Expect a defined
+   cancellation/error and no data transfer or residual group. Re-enable/grant and
+   reset before retry. Do not expect the app to enable Wi-Fi itself.
+6. Try with a pre-existing unrelated P2P group. Setup must reject it without removing
+   or adopting it. Do not measure background/screen-off endurance in this step.
+
+| Check | Sender/receiver model, API, date, evidence/result |
+| --- | --- |
+| API 29/32 permissions and sender owner / receiver client | PENDING |
+| API 33/34+ Nearby Wi-Fi permission and actual group | PENDING |
+| Actual 5 GHz frequency | PENDING |
+| 1 GiB exact bytes, duration, MB/s >=15, SHA-256 | PENDING |
+| Receiver Wi-Fi toggle: same session resumed, SHA-256 | PENDING |
+| Sender Wi-Fi toggle: recreated owner group, resumed, SHA-256 | PENDING |
+| Cancel/create/join/transfer, Deny, Done: group cleanup | PENDING |
+| Denied permission / Wi-Fi off / Location off | PENDING |
+| Unrelated existing group preserved | PENDING |

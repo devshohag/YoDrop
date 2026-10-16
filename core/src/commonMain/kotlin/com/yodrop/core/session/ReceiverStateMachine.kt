@@ -27,7 +27,7 @@ import kotlinx.coroutines.sync.withLock
 class ReceiverStateMachine(
     private val scope: CoroutineScope,
     private val resumeStore: ResumeStore = InMemoryResumeStore(),
-    private val onCleanup: (() -> Unit)? = null,
+    private val onCleanup: (suspend () -> Unit)? = null,
     private val sinkFactory: (FileMeta) -> FileSink = { meta ->
         throw NotImplementedError("sinkFactory must be provided for receiving files")
     },

@@ -17,8 +17,7 @@ import com.yodrop.android.ui.MainScreen
 import com.yodrop.android.ble.AndroidBleManager
 import com.yodrop.android.transport.AndroidSenderTransportSelector
 import com.yodrop.android.transport.AndroidSenderLinkSetup
-import com.yodrop.core.transport.LanTransport
-import com.yodrop.core.protocol.LinkType
+import com.yodrop.android.transport.AndroidReceiverLinkSetup
 import com.yodrop.core.crypto.CryptoEngine
 import com.yodrop.core.protocol.DeviceCaps
 import com.yodrop.core.protocol.HelloMessage
@@ -62,6 +61,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var ble: AndroidBleManager
     private lateinit var handshake: BleHandshakeController
+    private lateinit var receiverLinkSetup: AndroidReceiverLinkSetup
     private lateinit var senderLinkSetup: AndroidSenderLinkSetup
     private var pendingBleAction: (() -> Unit)? = null
     private val requestBlePermissions = registerForActivityResult(
@@ -70,7 +70,7 @@ class MainActivity : ComponentActivity() {
         val action = pendingBleAction
         pendingBleAction = null
         if (grants.isNotEmpty() && grants.values.all { it }) action?.let { withBlePermissions(it) }
-        else Toast.makeText(this, "Bluetooth permissions are required", Toast.LENGTH_LONG).show()
+        else Toast.makeText(this, "Nearby device permissions are required", Toast.LENGTH_LONG).show()
     }
 
     private lateinit var senderMachine: SenderStateMachine
@@ -85,11 +85,13 @@ class MainActivity : ComponentActivity() {
 
         receiverMachine = ReceiverStateMachine(
             scope = lifecycleScope,
-            sinkFactory = { meta -> createScopedStorageFileSink(meta) }
+            sinkFactory = { meta -> createScopedStorageFileSink(meta) },
+            onCleanup = { if (::receiverLinkSetup.isInitialized) receiverLinkSetup.close() }
         )
 
         val selector = AndroidSenderTransportSelector(this, senderMachine)
-        senderLinkSetup = AndroidSenderLinkSetup(lifecycleScope, senderMachine, selector)
+        senderLinkSetup = AndroidSenderLinkSetup(lifecycleScope, senderMachine, selector, this)
+        receiverLinkSetup = AndroidReceiverLinkSetup(this, lifecycleScope, receiverMachine)
         val hello = HelloMessage(
             deviceName = Build.MODEL.ifBlank { "Android" }.take(64),
             platform = Platform.ANDROID,
@@ -113,12 +115,7 @@ class MainActivity : ComponentActivity() {
             helloSnapshot = helloSnapshot,
             onOfferRead = { peer, offer -> ble.offerRead(peer, offer) },
             connectForClaim = { peer, offer -> ble.connectForClaim(peer, offer) },
-            onLinkReady = { link ->
-                if (link.linkType == LinkType.LAN) {
-                    val connection = LanTransport().connect(link)
-                    receiverMachine.attachConnection(connection)
-                }
-            }
+            onLinkReady = { link -> receiverLinkSetup.prepare(link) }
         ) { peer, message ->
             ble.sendControlMessage(peer, message)
         }
@@ -139,6 +136,7 @@ class MainActivity : ComponentActivity() {
                 try {
                     if (state is SenderState.Grabbed) ble.startAdvertising(state)
                     else ble.stopAdvertising()
+                    if (state is SenderState.Failed && state.canResume) senderLinkSetup.recover()
                     if (state is SenderState.Done || state is SenderState.Cancelled ||
                         (state is SenderState.Failed && !state.canResume)) ble.close()
                 } catch (_: SecurityException) { showBleError() }
@@ -148,6 +146,7 @@ class MainActivity : ComponentActivity() {
             receiverMachine.state.collect { state ->
                 try {
                     if (state !is ReceiverState.Scanning) ble.stopScanning()
+                    if (state is ReceiverState.Failed && state.canResume) receiverLinkSetup.recover()
                     if (state is ReceiverState.Done || state is ReceiverState.Cancelled ||
                         (state is ReceiverState.Failed && !state.canResume)) ble.close()
                 } catch (_: SecurityException) { showBleError() }
@@ -208,11 +207,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun withBlePermissions(action: () -> Unit) {
-        val permissions = if (Build.VERSION.SDK_INT >= 31) arrayOf(
-            Manifest.permission.BLUETOOTH_SCAN,
-            Manifest.permission.BLUETOOTH_ADVERTISE,
-            Manifest.permission.BLUETOOTH_CONNECT
-        ) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        val permissions = buildList {
+            if (Build.VERSION.SDK_INT >= 31) addAll(listOf(
+                Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_ADVERTISE,
+                Manifest.permission.BLUETOOTH_CONNECT))
+            if (Build.VERSION.SDK_INT <= 32) add(Manifest.permission.ACCESS_FINE_LOCATION)
+            if (Build.VERSION.SDK_INT >= 33 && packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_DIRECT))
+                add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }.toTypedArray()
         val missing = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) {
             pendingBleAction = action
@@ -231,7 +233,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showBleError() {
-        Toast.makeText(this, "Bluetooth operation failed. Please try again.", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "Connection failed. Check Bluetooth, Wi-Fi, Location and permissions.", Toast.LENGTH_LONG).show()
     }
 
     override fun onDestroy() {

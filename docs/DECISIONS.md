@@ -532,3 +532,49 @@ now describe this approved behavior.
 
 Validation details are in STEP15-VALIDATION.md. Physical scanner/two-phone results
 remain PENDING; this is compatibility preparation, not an implemented iOS sender.
+
+## [Step 16] Actual Android Wi-Fi Direct group and terminal lifecycle
+
+- `AndroidWifiDirectPlatform` initializes a WifiP2pManager channel, registers the
+  P2P state/peer/connection broadcasts, starts peer discovery and queries peers,
+  connection info and group info. Broadcast payloads do not supply trusted addresses.
+- After ACCEPT, the sender creates an autonomous, nonpersistent group through the
+  API 29+ credential-based WifiP2pConfig/createGroup API. This makes sender the group
+  owner; returned isGroupOwner is checked. Fresh random DIRECT-xy network name and
+  passphrase are validated; queried group credentials must match that request.
+  A 5 GHz capable owner requests 5 GHz, with AUTO retry if that request returns the
+  platform ERROR code. Actual frequency is recorded without credentials in logs.
+- Receiver uses API 29+ SSID/passphrase-based connect, so no local/randomized P2P MAC
+  or guessed gateway is needed. Credentials, actual queried owner IPv4 address and
+  the sender listener's ephemeral port travel in the existing encrypted LINK_INFO.
+  Credentials and group snapshot toString output are redacted. No SSID/passphrase
+  is printed by setup, errors or diagnostic logs.
+- Shared `WifiDirectSession` owns role/credential/address validation, 12-second
+  setup deadline, serialized lifecycle, cancellation and idempotent NonCancellable
+  close. Setup/recovery is platform-callback based. An unrelated existing group is
+  rejected before create/join; the adapter removes only a group it requested.
+- Sender keeps its TCP listener until terminal cleanup. Receiver creates up to four
+  authenticated sockets through the existing TcpConnection/PlatformSocket adapter,
+  explicitly binding client sockets to the actual P2P interface IPv4 address.
+  Connection creation closes raw sockets even when cancellation races IO return.
+- On recoverable TCP loss, Android sender/receiver retry their same group and
+  reconnect workers within the state machines' existing 20-second reconnect budget.
+  Existing session keys, source, part file and chunk bitmap are retained; the real
+  shared receiver requests only missing chunks. Group credentials and owner IP
+  cannot be silently replaced. If the OS assigns a different owner IP, recovery
+  expires and a fresh session is required. The app never toggles Wi-Fi itself.
+- Both sender and receiver terminal hooks await listener/worker/group cleanup.
+  Receiver onCleanup is now suspend, matching sender; reset waits for it. Cleanup
+  waits briefly for a pending mutation callback, stops discovery, cancels connect,
+  attempts removeGroup and queries removal up to three times, unregisters the
+  receiver and closes its channel. If Android rejects/times out cleanup, a fixed
+  warning says removal is unconfirmed; this is not logged as a successful removal.
+- API 33+ requests NEARBY_WIFI_DEVICES at runtime (neverForLocation); <=32 requests
+  fine location, including Android 12. Wi-Fi Direct is an optional device feature.
+  The adapter checks Wi-Fi, Location Mode and permission before setup. Denial does
+  not start transfer; disabled prerequisites produce a defined cancellation/error.
+  No new dependency, version/minSdk change or Google Nearby API was introduced.
+
+Local verification and pending device evidence are in STEP16-VALIDATION.md.
+P4 hardware throughput/resume acceptance and Step 18 foreground service remain
+pending; passing JVM/socket tests does not establish a working radio link.

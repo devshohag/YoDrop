@@ -158,14 +158,14 @@ fun MainScreen(
             }
 
             senderState is SenderState.Failed -> {
-                Text("Transfer Failed: ${senderState.error}", color = MaterialTheme.colorScheme.error)
+                Text(if (senderState.canResume) "Connection lost. Reconnecting..." else "Transfer Failed: ${senderState.error}", color = MaterialTheme.colorScheme.error)
                 Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
                     Text("Reset")
                 }
             }
 
             receiverState is ReceiverState.Failed -> {
-                Text("Transfer Failed: ${receiverState.error}", color = MaterialTheme.colorScheme.error)
+                Text(if (receiverState.canResume) "Connection lost. Reconnecting..." else "Transfer Failed: ${receiverState.error}", color = MaterialTheme.colorScheme.error)
                 Button(onClick = onCancelClick, modifier = Modifier.padding(top = 16.dp)) {
                     Text("Reset")
                 }
